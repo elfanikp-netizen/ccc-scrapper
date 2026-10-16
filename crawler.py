@@ -34,6 +34,7 @@ OUTPUT_COLUMNS = [
 ]
 IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
+MAX_VENDOR_SEARCH_RETRIES = 3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("ccc-crawler")
@@ -312,7 +313,7 @@ class CCCCrawler:
         done.wait_for(state="visible", timeout=30000)
         done.click()
 
-    def open_part_results(self, oem: str) -> None:
+    def open_part_results(self, oem: str) -> int | None:
         self.checkpoint(f"Estimate: searching OEM {oem}")
         self.page.locator('a[aria-label="Estimate"]').click()
         filter_button = self.page.locator("button.filter-button:visible").first
@@ -416,9 +417,60 @@ class CCCCrawler:
         except PlaywrightTimeoutError as error:
             raise RuntimeError(f"CCC added no sourceable estimate line for OEM {oem}") from error
         source_tag.click()
-        self.checkpoint("Waiting for CCC vendor inventory search")
-        self.page.get_by_text("Searching vendor inventory", exact=False).wait_for(state="hidden", timeout=60000)
-        self.page.locator(".cdk-overlay-pane .table-row").first.wait_for(state="visible", timeout=20000)
+        return self.wait_for_vendor_inventory()
+
+    def wait_for_vendor_inventory(self) -> int | None:
+        retry_count = 0
+        self.vendor_search_retry_count = retry_count
+        offer_rows = self.page.locator(".cdk-overlay-pane .table-row")
+        retry_button = self.page.get_by_role("button", name=re.compile(r"retry|try again", re.I))
+        searching_text = self.page.get_by_text("Searching vendor inventory", exact=False)
+
+        while True:
+            self.checkpoint("Waiting for CCC vendor inventory search")
+            try:
+                searching_text.wait_for(state="hidden", timeout=60000)
+            except PlaywrightTimeoutError:
+                log.warning("CCC vendor search is still showing its loading state")
+
+            if self.first_visible(offer_rows) is not None:
+                return retry_count
+            retry_control = self.first_visible(retry_button)
+            if retry_control is None:
+                try:
+                    self.page.wait_for_function(
+                        """() => {
+                            const visible = element => !!element && !!(element.offsetWidth || element.offsetHeight);
+                            const offers = [...document.querySelectorAll('.cdk-overlay-pane .table-row')].some(visible);
+                            const retry = [...document.querySelectorAll('button')].some(button => visible(button) && /retry|try again/i.test(button.innerText));
+                            return offers || retry;
+                        }""",
+                        timeout=5000,
+                    )
+                except PlaywrightTimeoutError:
+                    pass
+                if self.first_visible(offer_rows) is not None:
+                    return retry_count
+                retry_control = self.first_visible(retry_button)
+                if retry_control is None:
+                    log.error("CCC vendor search ended without offers or a Retry control")
+                    return None
+
+            if retry_control is None:
+                log.error("CCC vendor search ended without offers or a Retry control")
+                return None
+            if retry_count >= MAX_VENDOR_SEARCH_RETRIES:
+                log.error("CCC vendor search still has no offers after %d retries", retry_count)
+                return None
+
+            retry_count += 1
+            self.vendor_search_retry_count = retry_count
+            self.checkpoint(f"Retrying CCC vendor inventory search ({retry_count}/{MAX_VENDOR_SEARCH_RETRIES})")
+            retry_control.click()
+            try:
+                searching_text.wait_for(state="visible", timeout=10000)
+            except PlaywrightTimeoutError:
+                pass
 
     def resolve_part_prompts(self) -> None:
         for _ in range(4):
@@ -500,12 +552,16 @@ class CCCCrawler:
             if not self.enter_vehicle(vin):
                 result["Status"] = "Vehicle/model not found; skipped"
             else:
-                self.open_part_results(oem)
-                result = self.summarize(vin, oem, self.read_offers())
-                log.info("Completed VIN=%s OEM=%s; iPart listed=%s", vin, oem, result["Ipart listed on CCC"])
-                done = self.page.get_by_role("button", name=re.compile("^DONE$", re.I))
-                if self.first_visible(done) is not None:
-                    done.click()
+                retry_count = self.open_part_results(oem)
+                if retry_count is None:
+                    retries = getattr(self, "vendor_search_retry_count", 0)
+                    result["Status"] = f"Vendor search failed after {retries} Retry clicks; skipped"
+                else:
+                    result = self.summarize(vin, oem, self.read_offers())
+                    log.info("Completed VIN=%s OEM=%s; iPart listed=%s", vin, oem, result["Ipart listed on CCC"])
+                    done = self.page.get_by_role("button", name=re.compile("^DONE$", re.I))
+                    if self.first_visible(done) is not None:
+                        done.click()
         except Exception as error:
             log.exception("Row failed: VIN=%s OEM=%s: %s", vin, oem, error)
             self.capture_failure(f"row_{record['_row']}_{vin}")
