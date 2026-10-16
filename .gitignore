@@ -1,0 +1,7 @@
+.env
+.venv/
+venv/
+__pycache__/
+playwright/.auth/
+artifacts/
+ccc-results.xlsx
