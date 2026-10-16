@@ -18,11 +18,25 @@ Set `CCC_USERNAME` and `CCC_PASSWORD` in `.env` on your machine. Credentials are
 
 ## Run
 
+Run with the browser visible:
+
 ```powershell
 python crawler.py --headed
 ```
 
-The first run is headed so the login and any unexpected prompts can be observed. `--headed` can be omitted for a headless run. Authentication cookies/local storage are saved to `playwright/.auth/ccc-state.json` and reused on later runs; delete that file to force a fresh login. Results are saved incrementally to `ccc-results.xlsx` (or `CCC_OUTPUT`).
+Run without opening a browser window:
+
+```powershell
+python crawler.py
+```
+
+Choose different input and result workbooks for a run with `--input` and `--output`:
+
+```powershell
+python crawler.py --headed --input .\data\parts.xlsx --output .\results\run-01.xlsx
+```
+
+The input workbook must have `VIN` and `OEM` header columns. The default paths are `input.xlsx` and `ccc-results.xlsx`; set `CCC_INPUT` and `CCC_OUTPUT` in `.env` to change those defaults. Command-line paths override the `.env` values. Each result row includes `date_time` in local `YYYY-MM-DD HH:MM:SS` format, recorded when that row's crawl processing finishes. Authentication cookies/local storage are saved to `playwright/.auth/ccc-state.json` and reused on later runs; delete that file to force a fresh login.
 
 ## Notes
 

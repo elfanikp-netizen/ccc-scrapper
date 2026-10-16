@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ OUTPUT_COLUMNS = [
     "Next Lowest CCC Supplier",
     "Lowest CCC Price Supplier",
     "Status",
+    "date_time",
 ]
 IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
@@ -492,26 +494,29 @@ class CCCCrawler:
     def crawl_row(self, record: dict[str, str]) -> dict[str, Any]:
         vin, oem = record["VIN"], record["OEM"]
         self.checkpoint(f"Input row {record['_row']}: VIN={vin}, OEM={oem}")
+        result: dict[str, Any] = {"VIN": vin, "OEM": oem}
         try:
             self.open_new_workfile()
             if not self.enter_vehicle(vin):
-                return {"VIN": vin, "OEM": oem, "Status": "Vehicle/model not found; skipped"}
-            self.open_part_results(oem)
-            result = self.summarize(vin, oem, self.read_offers())
-            log.info("Completed VIN=%s OEM=%s; iPart listed=%s", vin, oem, result["Ipart listed on CCC"])
-            done = self.page.get_by_role("button", name=re.compile("^DONE$", re.I))
-            if self.first_visible(done) is not None:
-                done.click()
-            return result
+                result["Status"] = "Vehicle/model not found; skipped"
+            else:
+                self.open_part_results(oem)
+                result = self.summarize(vin, oem, self.read_offers())
+                log.info("Completed VIN=%s OEM=%s; iPart listed=%s", vin, oem, result["Ipart listed on CCC"])
+                done = self.page.get_by_role("button", name=re.compile("^DONE$", re.I))
+                if self.first_visible(done) is not None:
+                    done.click()
         except Exception as error:
             log.exception("Row failed: VIN=%s OEM=%s: %s", vin, oem, error)
             self.capture_failure(f"row_{record['_row']}_{vin}")
-            return {"VIN": vin, "OEM": oem, "Status": f"ERROR: {error}"}
+            result["Status"] = f"ERROR: {error}"
         finally:
             try:
                 self.return_to_workfiles()
             except Exception as error:
                 log.error("Could not return to the Workfiles list after VIN=%s: %s", vin, error)
+            result["date_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return result
 
 
 def main() -> int:
