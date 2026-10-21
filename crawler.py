@@ -98,11 +98,19 @@ def save_results(path: Path, results: list[dict[str, Any]]) -> None:
 
 
 class CCCCrawler:
-    def __init__(self, page: Page, username: str, password: str, artifacts: Path):
+    def __init__(
+        self,
+        page: Page,
+        username: str,
+        password: str,
+        artifacts: Path,
+        description_target: str = TARGET_DESCRIPTION,
+    ):
         self.page = page
         self.username = username
         self.password = password
         self.artifacts = artifacts
+        self.description_target = description_target
         self.workfiles_url: str | None = None
         self.artifacts.mkdir(parents=True, exist_ok=True)
 
@@ -268,10 +276,6 @@ class CCCCrawler:
         log.info("New workfile opened: %s", self.page.url)
 
     def return_to_workfiles(self) -> None:
-        save_button = self.page.get_by_role("button", name="Save", exact=True)
-        if self.first_visible(save_button) is not None:
-            save_button.click()
-            self.page.wait_for_timeout(500)
         if self.workfiles_url:
             self.page.goto(self.workfiles_url, wait_until="domcontentloaded")
 
@@ -511,21 +515,26 @@ class CCCCrawler:
             row = rows.nth(row_index)
             description = row.locator(".column-description").inner_text().strip() if row.locator(".column-description").count() else ""
             vendor = row.locator(".column-vendor").inner_text().strip() if row.locator(".column-vendor").count() else ""
-            total_text = row.locator(".column-total").inner_text().strip() if row.locator(".column-total").count() else ""
-            total = parse_price(total_text)
-            if description and vendor and total is not None:
-                offers.append(PartOffer(vendor, description, total))
+            ext_price_text = row.locator(".column-ext-price").inner_text().strip() if row.locator(".column-ext-price").count() else ""
+            ext_price = parse_price(ext_price_text)
+            if description and vendor and ext_price is not None:
+                offers.append(PartOffer(vendor, description, ext_price))
         if not offers:
-            raise RuntimeError("CCC vendor result grid contained no readable Vendor/Description/Total rows")
+            raise RuntimeError("CCC vendor result grid contained no readable Vendor/Description/EXT. PRICE rows")
         return offers
 
     @staticmethod
-    def summarize(vin: str, oem: str, offers: list[PartOffer]) -> dict[str, Any]:
-        capa = [offer for offer in offers if normalize(offer.description) == normalize(TARGET_DESCRIPTION)]
+    def summarize(
+        vin: str,
+        oem: str,
+        offers: list[PartOffer],
+        description_target: str = TARGET_DESCRIPTION,
+    ) -> dict[str, Any]:
+        matching_offers = [offer for offer in offers if normalize(description_target) in normalize(offer.description)]
         ipart_available = any(normalize(offer.vendor) == normalize(IPART_VENDOR) for offer in offers)
-        ipart = [offer for offer in capa if normalize(offer.vendor) == normalize(IPART_VENDOR)]
-        non_ipart = [offer for offer in capa if normalize(offer.vendor) != normalize(IPART_VENDOR)]
-        sorted_all = sorted(capa, key=lambda offer: offer.total)
+        ipart = [offer for offer in matching_offers if normalize(offer.vendor) == normalize(IPART_VENDOR)]
+        non_ipart = [offer for offer in matching_offers if normalize(offer.vendor) != normalize(IPART_VENDOR)]
+        sorted_all = sorted(matching_offers, key=lambda offer: offer.total)
         lowest_external = min(non_ipart, key=lambda offer: offer.total) if non_ipart else None
         lowest_overall = sorted_all[0] if sorted_all else None
         second_lowest = sorted_all[1] if len(sorted_all) > 1 else None
@@ -540,7 +549,7 @@ class CCCCrawler:
             "Next Lowest CCC Price": second_lowest.total if second_lowest else None,
             "Next Lowest CCC Supplier": second_lowest.vendor if second_lowest else None,
             "Lowest CCC Price Supplier": lowest_overall.vendor if lowest_overall else None,
-            "Status": "OK" if capa else "No A/M: CAPA offers found",
+            "Status": "OK" if matching_offers else f"No offers matching description: {description_target}",
         }
 
     def crawl_row(self, record: dict[str, str]) -> dict[str, Any]:
@@ -557,11 +566,8 @@ class CCCCrawler:
                     retries = getattr(self, "vendor_search_retry_count", 0)
                     result["Status"] = f"Vendor search failed after {retries} Retry clicks; skipped"
                 else:
-                    result = self.summarize(vin, oem, self.read_offers())
+                    result = self.summarize(vin, oem, self.read_offers(), self.description_target)
                     log.info("Completed VIN=%s OEM=%s; iPart listed=%s", vin, oem, result["Ipart listed on CCC"])
-                    done = self.page.get_by_role("button", name=re.compile("^DONE$", re.I))
-                    if self.first_visible(done) is not None:
-                        done.click()
         except Exception as error:
             log.exception("Row failed: VIN=%s OEM=%s: %s", vin, oem, error)
             self.capture_failure(f"row_{record['_row']}_{vin}")
@@ -580,6 +586,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Crawl CCC vendor prices for VIN/OEM rows in an Excel file.")
     parser.add_argument("--input", type=Path, default=Path(os.getenv("CCC_INPUT", "input.xlsx")))
     parser.add_argument("--output", type=Path, default=Path(os.getenv("CCC_OUTPUT", "ccc-results.xlsx")))
+    parser.add_argument(
+        "--description",
+        default=os.getenv("CCC_DESCRIPTION", TARGET_DESCRIPTION),
+        help=f"Description substring to match when ranking offers (default: {TARGET_DESCRIPTION}).",
+    )
     parser.add_argument("--headed", action="store_true", help="Show the browser window (recommended for first run).")
     args = parser.parse_args()
 
@@ -610,7 +621,7 @@ def main() -> int:
             context_options["storage_state"] = str(AUTH_STATE)
         context: BrowserContext = browser.new_context(**context_options)
         page = context.new_page()
-        crawler = CCCCrawler(page, username, password, Path("artifacts"))
+        crawler = CCCCrawler(page, username, password, Path("artifacts"), args.description)
         try:
             crawler.sign_in_if_needed()
             context.storage_state(path=str(AUTH_STATE))

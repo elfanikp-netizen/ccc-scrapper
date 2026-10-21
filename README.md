@@ -36,7 +36,13 @@ Choose different input and result workbooks for a run with `--input` and `--outp
 python crawler.py --headed --input .\data\parts.xlsx --output .\results\run-01.xlsx
 ```
 
-The input workbook must have `VIN` and `OEM` header columns. The default paths are `input.xlsx` and `ccc-results.xlsx`; set `CCC_INPUT` and `CCC_OUTPUT` in `.env` to change those defaults. Command-line paths override the `.env` values. Each result row includes `date_time` in local `YYYY-MM-DD HH:MM:SS` format, recorded when that row's crawl processing finishes. Authentication cookies/local storage are saved to `playwright/.auth/ccc-state.json` and reused on later runs; delete that file to force a fresh login.
+Change the description substring used to select and rank offers with `--description`:
+
+```powershell
+python crawler.py --headed --description "A/M: CAPA"
+```
+
+The input workbook must have `VIN` and `OEM` header columns. The default paths are `input.xlsx` and `ccc-results.xlsx`; set `CCC_INPUT` and `CCC_OUTPUT` in `.env` to change those defaults. Set `CCC_DESCRIPTION` in `.env` to change the default description match (`A/M: CAPA`). Command-line options override their `.env` defaults. Description matching is case-insensitive substring matching, so `A/M: CAPA` also matches descriptions such as `A/M: CAPA, PP`. Each result row includes `date_time` in local `YYYY-MM-DD HH:MM:SS` format, recorded when that row's crawl processing finishes. Authentication cookies/local storage are saved to `playwright/.auth/ccc-state.json` and reused on later runs; delete that file to force a fresh login.
 
 ## Notes
 
