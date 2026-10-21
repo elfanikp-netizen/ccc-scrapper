@@ -316,6 +316,37 @@ class CCCCrawler:
         done = self.page.get_by_role("button", name=re.compile("^DONE$", re.I))
         done.wait_for(state="visible", timeout=30000)
         done.click()
+        self.handle_vehicle_recall_prompts()
+
+    def handle_vehicle_recall_prompts(self) -> None:
+        recall_notice = self.page.get_by_text(re.compile("vehicle recall notice", re.I)).first
+        try:
+            recall_notice.wait_for(state="visible", timeout=2500)
+        except PlaywrightTimeoutError:
+            return
+
+        self.checkpoint("Vehicle recall notice shown; acknowledging with OK")
+        self.click_text("OK")
+
+        print_notice = self.page.get_by_text(re.compile("print recall notice", re.I)).first
+        try:
+            print_notice.wait_for(state="visible", timeout=10000)
+        except PlaywrightTimeoutError:
+            log.info("No print-recall prompt appeared after acknowledging the recall notice")
+            return
+
+        self.checkpoint("Print recall notice prompt shown; choosing No")
+        no_pattern = re.compile(r"^\s*NO\s*$", re.I)
+        no_control = self.page.locator(".cdk-overlay-pane .dialog-actions button").filter(has_text=no_pattern)
+        visible_control = self.first_visible(no_control)
+        if visible_control is None:
+            no_control = self.page.locator(".cdk-overlay-pane .dialog-actions").get_by_text(no_pattern)
+            visible_control = self.first_visible(no_control)
+        if visible_control is None:
+            self.capture_failure("print_recall_no_control_not_found")
+            raise RuntimeError("Print recall prompt appeared, but its No control was not found")
+        visible_control.click()
+        self.page.get_by_text(re.compile("Print recall notice", re.I)).wait_for(state="hidden", timeout=10000)
 
     def open_part_results(self, oem: str) -> int | None:
         self.checkpoint(f"Estimate: searching OEM {oem}")
@@ -483,6 +514,7 @@ class CCCCrawler:
                     """() => {
                         const text = (document.body?.innerText || '').toLowerCase();
                         return text.includes('part does not match the model')
+                            || text.includes('part does not match the year of the vehicle')
                             || text.includes('refinish this part')
                             || text.includes('select additional labor')
                             || text.includes('removing duplicate part');
@@ -492,10 +524,10 @@ class CCCCrawler:
             except PlaywrightTimeoutError:
                 return
             prompt = normalize(self.page.locator("body").inner_text())
-            if "part does not match the model" in prompt:
+            if "part does not match the model" in prompt or "part does not match the year of the vehicle" in prompt:
                 self.page.get_by_role("button", name=re.compile("^Yes$", re.I)).last.click()
                 self.checkpoint("Accepted CCC model-mismatch confirmation for the selected part")
-                self.page.get_by_text(re.compile("Part does not match the model", re.I)).wait_for(state="hidden", timeout=10000)
+                self.page.get_by_text(re.compile("Part does not match the (model|year of the vehicle)", re.I)).wait_for(state="hidden", timeout=10000)
             elif "refinish this part" in prompt:
                 self.page.get_by_role("button", name=re.compile("^No$", re.I)).last.click()
                 self.page.get_by_text(re.compile("Refinish this part", re.I)).wait_for(state="hidden", timeout=10000)
@@ -504,7 +536,8 @@ class CCCCrawler:
                 self.page.get_by_text(re.compile("Select additional labor", re.I)).wait_for(state="hidden", timeout=10000)
             elif "removing duplicate part" in prompt:
                 self.page.get_by_role("button", name=re.compile("^OK$", re.I)).last.click()
-                raise RuntimeError("Catalog part was already present in this workfile")
+                self.checkpoint("Acknowledged CCC duplicate-part notice")
+                self.page.get_by_text(re.compile("Removing duplicate part", re.I)).wait_for(state="hidden", timeout=10000)
             else:
                 return
 

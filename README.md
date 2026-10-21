@@ -49,4 +49,5 @@ The input workbook must have `VIN` and `OEM` header columns. The default paths a
 - Use only an account and data you are authorized to access, and confirm the site's automation terms before running at scale.
 - CCC's interface may change or use controls that do not expose accessible labels. The crawler reports the failed step and saves page evidence so selectors can be adapted without losing completed rows.
 - If CCC vendor inventory returns a Retry control instead of offers, the crawler clicks Retry up to three times. If no offer grid appears, that VIN/OEM row is marked skipped with a vendor-search failure status and later rows continue.
+- After vehicle selection, if CCC shows a vehicle recall notice, the crawler acknowledges it with `OK` and chooses `No` when asked whether to print the recall notice. These clicks are skipped when the prompts do not appear.
 - “Next Lowest” is the second-lowest A/M: CAPA offer across all vendors. “Lowest CCC” and its supplier exclude iPart Automotive Inc. If no matching offer exists, the price/supplier cells are left blank and `Status` explains the result.
