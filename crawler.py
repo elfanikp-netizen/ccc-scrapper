@@ -566,9 +566,7 @@ class CCCCrawler:
         matching_offers = [offer for offer in offers if normalize(description_target) in normalize(offer.description)]
         ipart_available = any(normalize(offer.vendor) == normalize(IPART_VENDOR) for offer in offers)
         ipart = [offer for offer in matching_offers if normalize(offer.vendor) == normalize(IPART_VENDOR)]
-        non_ipart = [offer for offer in matching_offers if normalize(offer.vendor) != normalize(IPART_VENDOR)]
         sorted_all = sorted(matching_offers, key=lambda offer: offer.total)
-        lowest_external = min(non_ipart, key=lambda offer: offer.total) if non_ipart else None
         lowest_overall = sorted_all[0] if sorted_all else None
         second_lowest = sorted_all[1] if len(sorted_all) > 1 else None
         ipart_lowest = min(ipart, key=lambda offer: offer.total) if ipart else None
@@ -577,8 +575,8 @@ class CCCCrawler:
             "OEM": oem,
             "Ipart listed on CCC": ipart_available,
             "Ipart List Price CCC": ipart_lowest.total if ipart_lowest else None,
-            "Lowest CCC Price": lowest_external.total if lowest_external else None,
-            "Lowest CCC Supplier": lowest_external.vendor if lowest_external else None,
+            "Lowest CCC Price": lowest_overall.total if lowest_overall else None,
+            "Lowest CCC Supplier": lowest_overall.vendor if lowest_overall else None,
             "Next Lowest CCC Price": second_lowest.total if second_lowest else None,
             "Next Lowest CCC Supplier": second_lowest.vendor if second_lowest else None,
             "Lowest CCC Price Supplier": lowest_overall.vendor if lowest_overall else None,
