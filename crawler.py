@@ -35,6 +35,10 @@ OUTPUT_COLUMNS = [
 IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
 MAX_VENDOR_SEARCH_RETRIES = 3
+MODEL_MISMATCH_RE = re.compile(
+    r"part does not match (?:(?:the )?(?:year[, ]+)?model(?: of the vehicle)?|the year of the vehicle)",
+    re.I,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("ccc-crawler")
@@ -45,6 +49,10 @@ class PartOffer:
     vendor: str
     description: str
     total: float
+
+
+class CatalogPartNotFoundError(RuntimeError):
+    pass
 
 
 def normalize(value: str) -> str:
@@ -365,8 +373,7 @@ class CCCCrawler:
         except PlaywrightTimeoutError as error:
             category_labels = self.page.locator(".part-group-name:visible, .group-list-item:visible, [class*=group-list-item]:visible")
             if not category_labels.count():
-                self.page.get_by_text(re.compile("No results|no parts found", re.I)).wait_for(state="visible", timeout=1000)
-                raise RuntimeError(f"No estimate result appeared for OEM {oem}") from error
+                raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}") from error
 
         parts = self.page.locator("app-part-selector-part-row:visible")
         category_names = categories.all_inner_texts() if categories.count() else []
@@ -431,7 +438,7 @@ class CCCCrawler:
                 selected_group.click(force=True)
                 self.page.locator("button.group-list-item:visible").first.wait_for(timeout=10000)
         if not selected_parts or not parts.count():
-            raise RuntimeError(f"No catalog part result appeared for OEM {oem} in any returned category")
+            raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem} in any returned category")
 
         self.checkpoint("Double-clicking the first filtered catalog part")
         parts.first.dblclick()
@@ -513,8 +520,7 @@ class CCCCrawler:
                 self.page.wait_for_function(
                     """() => {
                         const text = (document.body?.innerText || '').toLowerCase();
-                        return text.includes('part does not match the model')
-                            || text.includes('part does not match the year of the vehicle')
+                        return (text.includes('part does not match') && (text.includes('model') || text.includes('year')))
                             || text.includes('refinish this part')
                             || text.includes('select additional labor')
                             || text.includes('removing duplicate part');
@@ -524,10 +530,10 @@ class CCCCrawler:
             except PlaywrightTimeoutError:
                 return
             prompt = normalize(self.page.locator("body").inner_text())
-            if "part does not match the model" in prompt or "part does not match the year of the vehicle" in prompt:
+            if MODEL_MISMATCH_RE.search(prompt):
                 self.page.get_by_role("button", name=re.compile("^Yes$", re.I)).last.click()
                 self.checkpoint("Accepted CCC model-mismatch confirmation for the selected part")
-                self.page.get_by_text(re.compile("Part does not match the (model|year of the vehicle)", re.I)).wait_for(state="hidden", timeout=10000)
+                self.page.get_by_text(MODEL_MISMATCH_RE).wait_for(state="hidden", timeout=10000)
             elif "refinish this part" in prompt:
                 self.page.get_by_role("button", name=re.compile("^No$", re.I)).last.click()
                 self.page.get_by_text(re.compile("Refinish this part", re.I)).wait_for(state="hidden", timeout=10000)
@@ -564,8 +570,8 @@ class CCCCrawler:
         description_target: str = TARGET_DESCRIPTION,
     ) -> dict[str, Any]:
         matching_offers = [offer for offer in offers if normalize(description_target) in normalize(offer.description)]
-        ipart_available = any(normalize(offer.vendor) == normalize(IPART_VENDOR) for offer in offers)
         ipart = [offer for offer in matching_offers if normalize(offer.vendor) == normalize(IPART_VENDOR)]
+        ipart_available = bool(ipart)
         sorted_all = sorted(matching_offers, key=lambda offer: offer.total)
         lowest_overall = sorted_all[0] if sorted_all else None
         second_lowest = sorted_all[1] if len(sorted_all) > 1 else None
@@ -599,6 +605,9 @@ class CCCCrawler:
                 else:
                     result = self.summarize(vin, oem, self.read_offers(), self.description_target)
                     log.info("Completed VIN=%s OEM=%s; iPart listed=%s", vin, oem, result["Ipart listed on CCC"])
+        except CatalogPartNotFoundError as error:
+            log.warning("Skipping VIN=%s OEM=%s: %s", vin, oem, error)
+            result["Status"] = f"{error}; skipped"
         except Exception as error:
             log.exception("Row failed: VIN=%s OEM=%s: %s", vin, oem, error)
             self.capture_failure(f"row_{record['_row']}_{vin}")
