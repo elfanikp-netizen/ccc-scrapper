@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict, deque
+import json
 import logging
 import os
 import re
@@ -32,6 +33,7 @@ OUTPUT_COLUMNS = [
     "Lowest CCC Price Supplier",
     "Status",
     "date_time",
+    "market_data",
 ]
 IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
@@ -40,6 +42,19 @@ MODEL_MISMATCH_RE = re.compile(
     r"part does not match (?:(?:the )?(?:year[, ]+)?model(?: of the vehicle)?|the year of the vehicle)",
     re.I,
 )
+MARKET_DATA_FIELDS = {
+    "description": "description",
+    "vendor": "vendor",
+    "partno": "part-no",
+    "partnumber": "part-no",
+    "delivery": "delivery",
+    "extprice": "ext-price",
+    "labor": "labor",
+    "paint": "paint",
+    "total": "total",
+    "diff": "diff",
+    "margin": "margin",
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("ccc-crawler")
@@ -604,6 +619,46 @@ class CCCCrawler:
             raise RuntimeError("CCC vendor result grid contained no readable Vendor/Description/EXT. PRICE rows")
         return offers
 
+    def read_market_data(self) -> list[dict[str, str]]:
+        market_data: list[dict[str, str]] = []
+        rows = self.page.locator(".cdk-overlay-pane .table-row")
+        for row_index in range(rows.count()):
+            row = rows.nth(row_index)
+            cells = row.locator('[class*="column-"]')
+            row_data = {field: "" for field in MARKET_DATA_FIELDS.values()}
+            for cell_index in range(cells.count()):
+                cell = cells.nth(cell_index)
+                class_names = (cell.get_attribute("class") or "").split()
+                column_suffix = next(
+                    (class_name.removeprefix("column-") for class_name in class_names if class_name.startswith("column-")),
+                    "",
+                )
+                field_name = MARKET_DATA_FIELDS.get(re.sub(r"[^a-z0-9]", "", column_suffix.casefold()))
+                if not field_name:
+                    continue
+                value = cell.inner_text().strip()
+                if field_name == "part-no":
+                    full_values = cell.evaluate(
+                        """element => {
+                            const attributes = ['data-full-value', 'data-original-value', 'data-value', 'title', 'aria-label'];
+                            const elements = [element, ...element.querySelectorAll('*')];
+                            return elements.flatMap(node => attributes
+                                .map(name => node.getAttribute(name))
+                                .filter(value => value && value.trim())
+                                .map(value => value.trim()));
+                        }"""
+                    )
+                    complete_values = [
+                        candidate for candidate in full_values
+                        if len(candidate) > len(value) and not re.search(r"(?:\.\.\.|…)", candidate)
+                    ]
+                    if complete_values:
+                        value = max(complete_values, key=len)
+                row_data[field_name] = value
+            if any(row_data.values()):
+                market_data.append(row_data)
+        return sorted(market_data, key=lambda item: normalize(item.get("description", "")))
+
     @staticmethod
     def summarize(
         vin: str,
@@ -645,7 +700,9 @@ class CCCCrawler:
                     retries = getattr(self, "vendor_search_retry_count", 0)
                     result["Status"] = f"Vendor search failed after {retries} Retry clicks; skipped"
                 else:
-                    result = self.summarize(vin, oem, self.read_offers(), self.description_target)
+                    offers = self.read_offers()
+                    result = self.summarize(vin, oem, offers, self.description_target)
+                    result["market_data"] = json.dumps(self.read_market_data(), ensure_ascii=False)
                     log.info("Completed VIN=%s OEM=%s; iPart listed=%s", vin, oem, result["Ipart listed on CCC"])
         except CatalogPartNotFoundError as error:
             log.warning("Skipping VIN=%s OEM=%s: %s", vin, oem, error)
