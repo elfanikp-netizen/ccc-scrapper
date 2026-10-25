@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter, defaultdict, deque
 import logging
 import os
 import re
@@ -103,6 +104,47 @@ def save_results(path: Path, results: list[dict[str, Any]]) -> None:
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
     workbook.save(path)
+
+
+def load_results(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = workbook.active
+        rows = sheet.iter_rows(values_only=True)
+        headers = [str(value or "").strip() for value in next(rows, ())]
+        header_indexes = {header: index for index, header in enumerate(headers)}
+        if "VIN" not in header_indexes or "OEM" not in header_indexes:
+            log.warning("Existing output has no VIN/OEM columns; starting without prior results")
+            return []
+        results = []
+        for row in rows:
+            result = {
+                column: row[index] if index < len(row) else None
+                for column, index in header_indexes.items()
+                if column in OUTPUT_COLUMNS
+            }
+            if result.get("VIN") and result.get("OEM"):
+                results.append(result)
+        return results
+    finally:
+        workbook.close()
+
+
+def resume_state(results: list[dict[str, Any]]) -> tuple[Counter, dict[tuple[str, str], deque[int]]]:
+    completed: Counter = Counter()
+    retry_rows: dict[tuple[str, str], deque[int]] = defaultdict(deque)
+    for index, result in enumerate(results):
+        key = (str(result.get("VIN") or "").strip(), str(result.get("OEM") or "").strip())
+        if not all(key):
+            continue
+        status = str(result.get("Status") or "").strip()
+        if status.upper().startswith("ERROR:"):
+            retry_rows[key].append(index)
+        else:
+            completed[key] += 1
+    return completed, retry_rows
 
 
 class CCCCrawler:
@@ -652,7 +694,25 @@ def main() -> int:
         log.error("No rows with both VIN and OEM were found in %s", args.input)
         return 2
 
-    results: list[dict[str, Any]] = []
+    results = load_results(args.output)
+    completed, retry_rows = resume_state(results)
+    if results:
+        log.info("Loaded %d saved result(s) from %s", len(results), args.output)
+    saved_remaining = completed.copy()
+    retry_remaining = Counter({key: len(indexes) for key, indexes in retry_rows.items()})
+    unfinished = 0
+    for record in records:
+        key = (record["VIN"], record["OEM"])
+        if saved_remaining[key] > 0:
+            saved_remaining[key] -= 1
+        elif retry_remaining[key] > 0:
+            retry_remaining[key] -= 1
+        else:
+            unfinished += 1
+    if unfinished == 0:
+        log.info("All %d input rows already have saved results", len(records))
+        return 0
+
     AUTH_STATE.parent.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=not args.headed)
@@ -668,7 +728,16 @@ def main() -> int:
             crawler.open_workfiles()
             for index, record in enumerate(records, start=1):
                 log.info("Progress: %d/%d", index, len(records))
-                results.append(crawler.crawl_row(record))
+                key = (record["VIN"], record["OEM"])
+                if completed[key] > 0:
+                    completed[key] -= 1
+                    log.info("Skipping row %d; result is already saved", index)
+                    continue
+                result = crawler.crawl_row(record)
+                if retry_rows[key]:
+                    results[retry_rows[key].popleft()] = result
+                else:
+                    results.append(result)
                 save_results(args.output, results)
                 log.info("Saved progress to %s", args.output)
         except Exception as error:
