@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,8 @@ OUTPUT_COLUMNS = [
 IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
 MAX_VENDOR_SEARCH_RETRIES = 3
+RESULT_SAVE_INTERVAL = 1
+RECALL_NOTICE_DETECT_TIMEOUT_MS = 1000
 MODEL_MISMATCH_RE = re.compile(
     r"part does not match (?:(?:the )?(?:year[, ]+)?model(?: of the vehicle)?|the year of the vehicle)",
     re.I,
@@ -69,6 +72,13 @@ class PartOffer:
 
 class CatalogPartNotFoundError(RuntimeError):
     pass
+
+
+def block_nonessential_resources(route: Any) -> None:
+    if route.request.resource_type in {"image", "media"}:
+        route.abort()
+    else:
+        route.continue_()
 
 
 def normalize(value: str) -> str:
@@ -110,6 +120,7 @@ def read_input(path: Path) -> list[dict[str, str]]:
 
 
 def save_results(path: Path, results: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "CCC Results"
@@ -118,7 +129,23 @@ def save_results(path: Path, results: list[dict[str, Any]]) -> None:
         sheet.append([result.get(column) for column in OUTPUT_COLUMNS])
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
-    workbook.save(path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=path.suffix,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        workbook.save(temporary_path)
+        with temporary_path.open("rb+") as saved_file:
+            os.fsync(saved_file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        workbook.close()
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def load_results(path: Path) -> list[dict[str, Any]]:
@@ -386,7 +413,7 @@ class CCCCrawler:
     def handle_vehicle_recall_prompts(self) -> None:
         recall_notice = self.page.get_by_text(re.compile("vehicle recall notice", re.I)).first
         try:
-            recall_notice.wait_for(state="visible", timeout=2500)
+            recall_notice.wait_for(state="visible", timeout=RECALL_NOTICE_DETECT_TIMEOUT_MS)
         except PlaywrightTimeoutError:
             return
 
@@ -442,7 +469,6 @@ class CCCCrawler:
             ]
         selected_parts = False
         for category_name in category_names:
-            self.page.wait_for_timeout(500)
             visible_categories = self.page.locator("button.group-list-item:visible")
             matching_category = None
             for index in range(visible_categories.count()):
@@ -521,42 +547,29 @@ class CCCCrawler:
     def wait_for_vendor_inventory(self) -> int | None:
         retry_count = 0
         self.vendor_search_retry_count = retry_count
-        offer_rows = self.page.locator(".cdk-overlay-pane .table-row")
         retry_button = self.page.get_by_role("button", name=re.compile(r"retry|try again", re.I))
-        searching_text = self.page.get_by_text("Searching vendor inventory", exact=False)
 
         while True:
             self.checkpoint("Waiting for CCC vendor inventory search")
             try:
-                searching_text.wait_for(state="hidden", timeout=60000)
+                outcome = self.page.wait_for_function(
+                    """() => {
+                        const visible = element => !!element && !!(element.offsetWidth || element.offsetHeight);
+                        if ([...document.querySelectorAll('.cdk-overlay-pane .table-row')].some(visible)) return 'offers';
+                        if ([...document.querySelectorAll('button')].some(button => visible(button) && /retry|try again/i.test(button.innerText))) return 'retry';
+                        return false;
+                    }""",
+                    timeout=60000,
+                ).json_value()
             except PlaywrightTimeoutError:
-                log.warning("CCC vendor search is still showing its loading state")
+                log.error("CCC vendor search produced no offers or Retry control within 60 seconds")
+                return None
 
-            if self.first_visible(offer_rows) is not None:
+            if outcome == "offers":
                 return retry_count
             retry_control = self.first_visible(retry_button)
             if retry_control is None:
-                try:
-                    self.page.wait_for_function(
-                        """() => {
-                            const visible = element => !!element && !!(element.offsetWidth || element.offsetHeight);
-                            const offers = [...document.querySelectorAll('.cdk-overlay-pane .table-row')].some(visible);
-                            const retry = [...document.querySelectorAll('button')].some(button => visible(button) && /retry|try again/i.test(button.innerText));
-                            return offers || retry;
-                        }""",
-                        timeout=5000,
-                    )
-                except PlaywrightTimeoutError:
-                    pass
-                if self.first_visible(offer_rows) is not None:
-                    return retry_count
-                retry_control = self.first_visible(retry_button)
-                if retry_control is None:
-                    log.error("CCC vendor search ended without offers or a Retry control")
-                    return None
-
-            if retry_control is None:
-                log.error("CCC vendor search ended without offers or a Retry control")
+                log.error("CCC exposed a Retry outcome but its button was not accessible")
                 return None
             if retry_count >= MAX_VENDOR_SEARCH_RETRIES:
                 log.error("CCC vendor search still has no offers after %d retries", retry_count)
@@ -566,10 +579,6 @@ class CCCCrawler:
             self.vendor_search_retry_count = retry_count
             self.checkpoint(f"Retrying CCC vendor inventory search ({retry_count}/{MAX_VENDOR_SEARCH_RETRIES})")
             retry_control.click()
-            try:
-                searching_text.wait_for(state="visible", timeout=10000)
-            except PlaywrightTimeoutError:
-                pass
 
     def resolve_part_prompts(self) -> None:
         for _ in range(4):
@@ -604,60 +613,47 @@ class CCCCrawler:
             else:
                 return
 
-    def read_offers(self) -> list[PartOffer]:
-        offers: list[PartOffer] = []
-        rows = self.page.locator(".cdk-overlay-pane .table-row")
-        for row_index in range(rows.count()):
-            row = rows.nth(row_index)
-            description = row.locator(".column-description").inner_text().strip() if row.locator(".column-description").count() else ""
-            vendor = row.locator(".column-vendor").inner_text().strip() if row.locator(".column-vendor").count() else ""
-            ext_price_text = row.locator(".column-ext-price").inner_text().strip() if row.locator(".column-ext-price").count() else ""
-            ext_price = parse_price(ext_price_text)
-            if description and vendor and ext_price is not None:
-                offers.append(PartOffer(vendor, description, ext_price))
+    def read_vendor_inventory(self) -> tuple[list[PartOffer], list[dict[str, str]]]:
+        rows = self.page.locator(".cdk-overlay-pane .table-row").evaluate_all(
+            """rows => {
+                const fields = {
+                    description: 'description', vendor: 'vendor', partno: 'part-no',
+                    partnumber: 'part-no', delivery: 'delivery', extprice: 'ext-price',
+                    labor: 'labor', paint: 'paint', total: 'total', diff: 'diff', margin: 'margin'
+                };
+                const outputFields = [...new Set(Object.values(fields))];
+                const attributes = ['data-full-value', 'data-original-value', 'data-value', 'title', 'aria-label'];
+                return rows.map(row => {
+                    const data = Object.fromEntries(outputFields.map(field => [field, '']));
+                    for (const cell of row.querySelectorAll('[class*="column-"]')) {
+                        const columnClass = [...cell.classList].find(name => name.startsWith('column-')) || '';
+                        const key = columnClass.slice(7).toLowerCase().replace(/[^a-z0-9]/g, '');
+                        const field = fields[key];
+                        if (!field) continue;
+                        let value = (cell.innerText || cell.textContent || '').trim();
+                        if (field === 'part-no') {
+                            const candidates = [cell, ...cell.querySelectorAll('*')].flatMap(node =>
+                                attributes.map(name => node.getAttribute(name)).filter(candidate => candidate && candidate.trim())
+                            ).map(candidate => candidate.trim()).filter(candidate =>
+                                candidate.length > value.length && !/(?:\\.\\.\\.|…)/.test(candidate)
+                            );
+                            if (candidates.length) value = candidates.reduce((best, candidate) => candidate.length > best.length ? candidate : best, value);
+                        }
+                        data[field] = value;
+                    }
+                    return data;
+                }).filter(data => Object.values(data).some(Boolean));
+            }"""
+        )
+        market_data = sorted(rows, key=lambda item: normalize(item.get("description", "")))
+        offers = []
+        for row in market_data:
+            total = parse_price(row["ext-price"])
+            if row["description"] and row["vendor"] and total is not None:
+                offers.append(PartOffer(row["vendor"], row["description"], total))
         if not offers:
             raise RuntimeError("CCC vendor result grid contained no readable Vendor/Description/EXT. PRICE rows")
-        return offers
-
-    def read_market_data(self) -> list[dict[str, str]]:
-        market_data: list[dict[str, str]] = []
-        rows = self.page.locator(".cdk-overlay-pane .table-row")
-        for row_index in range(rows.count()):
-            row = rows.nth(row_index)
-            cells = row.locator('[class*="column-"]')
-            row_data = {field: "" for field in MARKET_DATA_FIELDS.values()}
-            for cell_index in range(cells.count()):
-                cell = cells.nth(cell_index)
-                class_names = (cell.get_attribute("class") or "").split()
-                column_suffix = next(
-                    (class_name.removeprefix("column-") for class_name in class_names if class_name.startswith("column-")),
-                    "",
-                )
-                field_name = MARKET_DATA_FIELDS.get(re.sub(r"[^a-z0-9]", "", column_suffix.casefold()))
-                if not field_name:
-                    continue
-                value = cell.inner_text().strip()
-                if field_name == "part-no":
-                    full_values = cell.evaluate(
-                        """element => {
-                            const attributes = ['data-full-value', 'data-original-value', 'data-value', 'title', 'aria-label'];
-                            const elements = [element, ...element.querySelectorAll('*')];
-                            return elements.flatMap(node => attributes
-                                .map(name => node.getAttribute(name))
-                                .filter(value => value && value.trim())
-                                .map(value => value.trim()));
-                        }"""
-                    )
-                    complete_values = [
-                        candidate for candidate in full_values
-                        if len(candidate) > len(value) and not re.search(r"(?:\.\.\.|…)", candidate)
-                    ]
-                    if complete_values:
-                        value = max(complete_values, key=len)
-                row_data[field_name] = value
-            if any(row_data.values()):
-                market_data.append(row_data)
-        return sorted(market_data, key=lambda item: normalize(item.get("description", "")))
+        return offers, market_data
 
     @staticmethod
     def summarize(
@@ -700,9 +696,9 @@ class CCCCrawler:
                     retries = getattr(self, "vendor_search_retry_count", 0)
                     result["Status"] = f"Vendor search failed after {retries} Retry clicks; skipped"
                 else:
-                    offers = self.read_offers()
+                    offers, market_data = self.read_vendor_inventory()
                     result = self.summarize(vin, oem, offers, self.description_target)
-                    result["market_data"] = json.dumps(self.read_market_data(), ensure_ascii=False)
+                    result["market_data"] = json.dumps(market_data, ensure_ascii=False)
                     log.info("Completed VIN=%s OEM=%s; iPart listed=%s", vin, oem, result["Ipart listed on CCC"])
         except CatalogPartNotFoundError as error:
             log.warning("Skipping VIN=%s OEM=%s: %s", vin, oem, error)
@@ -778,7 +774,9 @@ def main() -> int:
             context_options["storage_state"] = str(AUTH_STATE)
         context: BrowserContext = browser.new_context(**context_options)
         page = context.new_page()
+        page.route("**/*", block_nonessential_resources)
         crawler = CCCCrawler(page, username, password, Path("artifacts"), args.description)
+        rows_since_save = 0
         try:
             crawler.sign_in_if_needed()
             context.storage_state(path=str(AUTH_STATE))
@@ -795,12 +793,24 @@ def main() -> int:
                     results[retry_rows[key].popleft()] = result
                 else:
                     results.append(result)
+                rows_since_save += 1
+                if rows_since_save >= RESULT_SAVE_INTERVAL:
+                    save_results(args.output, results)
+                    rows_since_save = 0
+                    log.info("Saved progress to %s", args.output)
+            if rows_since_save:
                 save_results(args.output, results)
-                log.info("Saved progress to %s", args.output)
+                log.info("Saved final progress to %s", args.output)
         except Exception as error:
             log.exception("Crawler stopped before completing all rows: %s", error)
-            crawler.capture_failure("crawler_stopped")
-            save_results(args.output, results)
+            try:
+                save_results(args.output, results)
+            except Exception:
+                log.exception("Could not save partial results to %s", args.output)
+            try:
+                crawler.capture_failure("crawler_stopped")
+            except Exception:
+                log.exception("Could not capture failure evidence")
             return 1
         finally:
             context.close()
