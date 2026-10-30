@@ -23,6 +23,9 @@ from playwright.sync_api import BrowserContext, Error as PlaywrightError, Locato
 BASE_URL = "https://www.cccone.com/login/login-idp"
 AUTH_STATE = Path("playwright/.auth/ccc-state.json")
 OUTPUT_COLUMNS = [
+    "Year",
+    "Make",
+    "Model",
     "VIN",
     "OEM",
     "Ipart listed on CCC",
@@ -49,6 +52,11 @@ NO_SOURCE_PARTS_RE = re.compile(
     r"no part lines to source|source parts\s*[:\-]?\s*0|0\s*source parts|enter part price",
     re.I,
 )
+VEHICLE_TITLE_RE = re.compile(
+    r"(?:^|\n)\s*New workfile,\s*(\d{4})\s+([A-Za-z][A-Za-z-]*)\s+(.+?)\s*(?:\n|$)",
+    re.I,
+)
+MULTIWORD_MAKES = ("Alfa Romeo", "Aston Martin", "Land Rover", "Rolls Royce")
 MARKET_DATA_FIELDS = {
     "description": "description",
     "vendor": "vendor",
@@ -93,12 +101,32 @@ def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip().casefold()
 
 
+def is_no_catalog_results(body_text: str) -> bool:
+    text = normalize(body_text)
+    return "no results found for search text:" in text
+
+
 def parse_price(value: str) -> float | None:
     cleaned = re.sub(r"[^0-9.\-]", "", value.replace(",", ""))
     try:
         return float(cleaned)
     except ValueError:
         return None
+
+
+def extract_vehicle_details(page_text: str) -> dict[str, str]:
+    match = VEHICLE_TITLE_RE.search(page_text)
+    if match is None:
+        return {"Year": "", "Make": "", "Model": ""}
+
+    year, make, model = match.groups()
+    title = f"{make} {model}"
+    for multiword_make in MULTIWORD_MAKES:
+        if title.casefold().startswith(f"{multiword_make.casefold()} "):
+            make = title[:len(multiword_make)]
+            model = title[len(multiword_make):].strip()
+            break
+    return {"Year": year, "Make": make, "Model": model.strip()}
 
 
 def read_input(path: Path) -> list[dict[str, str]]:
@@ -215,6 +243,7 @@ class CCCCrawler:
         self.description_target = description_target
         self.workfiles_url: str | None = None
         self._workfile_initialized = False
+        self._vehicle_details: dict[str, str] = {"Year": "", "Make": "", "Model": ""}
         self.artifacts.mkdir(parents=True, exist_ok=True)
 
     def checkpoint(self, label: str) -> None:
@@ -416,6 +445,7 @@ class CCCCrawler:
             self.page.goto(self.workfiles_url, wait_until="domcontentloaded")
 
     def enter_vehicle(self, vin: str) -> bool:
+        self._vehicle_details = {"Year": "", "Make": "", "Model": ""}
         self.checkpoint(f"Vehicle: searching VIN {vin}")
         self.dismiss_jumpstart_prompt()
         self.page.locator('a[aria-label="Vehicle"]').click()
@@ -423,20 +453,58 @@ class CCCCrawler:
         vin_box = self.page.locator(".vin-input input.input-box:visible").last
         vin_box.wait_for(state="visible", timeout=10000)
         vin_box.fill(vin)
-        self.page.get_by_text("Valid VIN", exact=True).wait_for(state="visible", timeout=20000)
-        self.checkpoint("CCC validated the VIN; advancing to model selection")
+        try:
+            self.page.wait_for_function(
+                """() => {
+                    const visible = element => {
+                        const rect = element.getBoundingClientRect();
+                        const style = getComputedStyle(element);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                    };
+                    const text = document.body?.innerText || '';
+                    if (/Unable to decode\\. Please verify VIN or proceed\\./i.test(text)) return 'decode-warning';
+                    if ([...document.querySelectorAll('*')].some(element =>
+                        visible(element) && element.children.length === 0 && (element.textContent || '').trim() === 'Valid VIN'
+                    )) return 'valid';
+                    return false;
+                }""",
+                timeout=30000,
+            )
+        except PlaywrightTimeoutError as error:
+            raise RuntimeError(f"CCC did not validate or present a proceed option for VIN {vin}") from error
+        decode_warning = self.page.get_by_text(
+            re.compile(r"Unable to decode\. Please verify VIN or proceed\.", re.I)
+        ).first
+        if self.first_visible(decode_warning) is not None:
+            log.warning("CCC could not decode VIN %s but offers a proceed option; continuing", vin)
+        else:
+            self.checkpoint("CCC validated the VIN; advancing to model selection")
         self.click_text("Next")
         selection_state = self.resolve_vehicle_change_state(self.page.url)
+        if selection_state == "unknown-vehicle":
+            self.checkpoint(f"CCC could not identify VIN {vin}; manual vehicle details are required")
+            return False
         while selection_state == "options":
             options = self.page.locator('[role="option"]:visible')
             options.first.click()
             self.checkpoint("CCC vehicle model selected; advancing to Finish")
             self.click_text("Next")
             selection_state = self.resolve_vehicle_change_state(self.page.url)
+            if selection_state == "unknown-vehicle":
+                self.checkpoint(f"CCC could not identify VIN {vin}; manual vehicle details are required")
+                return False
         if selection_state != "done":
             raise FatalCrawlerError(f"Unexpected CCC vehicle selection state: {selection_state}")
         self.checkpoint("CCC vehicle selection complete; clicking DONE")
         self.finish_vehicle_selection()
+        self._vehicle_details = extract_vehicle_details(self.page.locator("body").inner_text())
+        if self._vehicle_details["Year"]:
+            log.info(
+                "Selected vehicle: Year=%s Make=%s Model=%s",
+                self._vehicle_details["Year"],
+                self._vehicle_details["Make"],
+                self._vehicle_details["Model"],
+            )
         log.info("Vehicle selected for VIN %s", vin)
         return True
 
@@ -465,6 +533,8 @@ class CCCCrawler:
                     visible(pane) && /Any estimate lines written will be erased[\\s\\S]*Change vehicle anyway\\?/i.test(pane.innerText || '')
                 );
                 if (changeConfirmation) return 'change-confirmation';
+                const text = document.body?.innerText || '';
+                if (/Unknown vehicle/i.test(text) && /Year\\*/i.test(text) && /Make\\*/i.test(text)) return 'unknown-vehicle';
                 const options = [...document.querySelectorAll('[role="option"]')].some(option =>
                     visible(option) && (option.innerText || option.textContent || '').trim().length > 0
                 );
@@ -637,9 +707,15 @@ class CCCCrawler:
         except PlaywrightTimeoutError as error:
             category_labels = self.page.locator(".part-group-name:visible, .group-list-item:visible, [class*=group-list-item]:visible")
             if not category_labels.count():
+                body_text = normalize(self.page.locator("body").inner_text())
+                if is_no_catalog_results(body_text):
+                    raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}") from error
                 raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}") from error
 
         parts = self.page.locator("app-part-selector-part-row:visible")
+        body_text = normalize(self.page.locator("body").inner_text())
+        if is_no_catalog_results(body_text):
+            raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
         category_names = categories.all_inner_texts() if categories.count() else []
         if not category_names:
             category_names = [
@@ -649,6 +725,9 @@ class CCCCrawler:
             ]
         selected_parts = False
         for category_name in category_names:
+            body_text = normalize(self.page.locator("body").inner_text())
+            if is_no_catalog_results(body_text):
+                raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
             visible_categories = self.page.locator("button.group-list-item:visible")
             matching_category = None
             for index in range(visible_categories.count()):
@@ -674,6 +753,9 @@ class CCCCrawler:
                 selected_parts = True
             except PlaywrightTimeoutError:
                 pass
+            body_text = normalize(self.page.locator("body").inner_text())
+            if is_no_catalog_results(body_text):
+                raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
             for _ in range(10):
                 if selected_parts or parts.count():
                     selected_parts = True
@@ -719,49 +801,130 @@ class CCCCrawler:
         if not selected_parts or not parts.count():
             raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem} in any returned category")
 
-        self.checkpoint("Double-clicking the first filtered catalog part")
-        parts.first.dblclick()
-        self.resolve_part_prompts()
-        body_text = normalize(self.page.locator("body").inner_text())
-        no_source_parts = bool(NO_SOURCE_PARTS_RE.search(body_text))
-        source_tab = self.page.locator("[role=tab].source-parts-tab")
-        if not source_tab.count() and no_source_parts:
-            log.warning("CCC created the estimate line for OEM %s without sourceable parts; skipping vendor lookup", oem)
+        candidate_limit = min(max(2, len(category_names)), max(3, parts.count()))
+        for part_index in range(candidate_limit):
+            candidate = parts.nth(part_index)
+            if not candidate.count():
+                break
+            self.checkpoint(f"Double-clicking catalog result {part_index + 1} for OEM {oem}")
+            try:
+                candidate.dblclick(timeout=15000)
+            except PlaywrightError:
+                if part_index + 1 >= candidate_limit:
+                    raise
+                continue
+            self.resolve_part_prompts()
+            self.dismiss_enter_part_price_prompt()
+            body_text = normalize(self.page.locator("body").inner_text())
+            no_source_parts = bool(NO_SOURCE_PARTS_RE.search(body_text))
+            source_tab = self.page.locator("[role=tab].source-parts-tab")
+            if not source_tab.count() and no_source_parts:
+                log.info("Catalog part %s for OEM %s is non-sourceable; trying the next catalog match", part_index + 1, oem)
+                continue
+            try:
+                source_tab.wait_for(state="visible", timeout=10000)
+            except PlaywrightTimeoutError:
+                if no_source_parts:
+                    log.info("Catalog part %s for OEM %s is non-sourceable; trying the next catalog match", part_index + 1, oem)
+                    continue
+                if part_index + 1 < candidate_limit:
+                    continue
+                raise RuntimeError(f"Part selection did not complete for OEM {oem}; Source parts tab never appeared") from None
+            try:
+                enabled = self.page.wait_for_function(
+                    """() => {
+                        const tab = document.querySelector('[role="tab"].source-parts-tab');
+                        if (!tab) return 'missing';
+                        return tab.getAttribute('aria-disabled') === 'false' ? 'enabled' : 'disabled';
+                    }""",
+                    timeout=30000,
+                ).json_value()
+            except PlaywrightTimeoutError:
+                enabled = "disabled-timeout"
+            if enabled != "enabled":
+                body_text = normalize(self.page.locator("body").inner_text())
+                if no_source_parts or NO_SOURCE_PARTS_RE.search(body_text):
+                    log.info("Catalog part %s for OEM %s has no sourceable estimate line; trying the next catalog match", part_index + 1, oem)
+                    continue
+                if part_index + 1 < candidate_limit:
+                    continue
+                log.warning("CCC Source parts tab is %s for OEM %s; retrying the estimate line", enabled, oem)
+                return self.retry_source_parts(oem)
+            source_tab.click()
+            source_tag = self.page.get_by_role("button", name="Show sourced parts").first
+            try:
+                source_tag.wait_for(state="visible", timeout=10000)
+            except PlaywrightTimeoutError as error:
+                body_text = normalize(self.page.locator("body").inner_text())
+                if NO_SOURCE_PARTS_RE.search(body_text):
+                    log.info("Catalog part %s for OEM %s has no sourceable estimate line; trying the next catalog match", part_index + 1, oem)
+                    continue
+                if part_index + 1 < candidate_limit:
+                    continue
+                raise RuntimeError(f"CCC added no sourceable estimate line for OEM {oem}") from error
+            source_tag.click()
+            result = self.wait_for_vendor_inventory()
+            if result is not None:
+                return result
+            if part_index + 1 < candidate_limit:
+                continue
             return None
+
+        return None
+
+    def dismiss_enter_part_price_prompt(self) -> None:
+        prompt = self.page.get_by_text(re.compile(r"^\s*Enter part price\.?\s*$", re.I)).first
         try:
-            source_tab.wait_for(state="visible", timeout=10000)
+            prompt.wait_for(state="visible", timeout=1500)
         except PlaywrightTimeoutError:
-            if no_source_parts:
-                log.warning("CCC created the estimate line for OEM %s without sourceable parts; skipping vendor lookup", oem)
-                return None
-            raise RuntimeError(f"Part selection did not complete for OEM {oem}; Source parts tab never appeared") from None
+            return
+        dialog = self.page.locator(".cdk-overlay-pane").filter(has_text=re.compile(r"Enter part price", re.I)).last
+        ok_button = dialog.get_by_role("button", name=re.compile(r"^\s*OK\s*$", re.I))
+        button = self.first_visible(ok_button)
+        if button is None:
+            button = self.first_visible(dialog.get_by_text(re.compile(r"^\s*OK\s*$", re.I)))
+        if button is None:
+            self.capture_failure("enter_part_price_ok_not_found")
+            raise RuntimeError("CCC's Enter part price prompt appeared without a visible OK control")
+        self.checkpoint("CCC Enter part price prompt shown; acknowledging with OK")
+        button.click(timeout=10000)
+        prompt.wait_for(state="hidden", timeout=10000)
+
+    def retry_source_parts(self, oem: str) -> int | None:
+        retry_button = self.first_visible(
+            self.page.get_by_role("button", name=re.compile(r"^\s*RETRY\s*$", re.I))
+        )
+        if retry_button is None:
+            raise RuntimeError(f"CCC kept Source parts disabled for OEM {oem}; retry button not found")
+        self.checkpoint(f"Retrying CCC source-parts preparation for OEM {oem}")
+        retry_button.click(timeout=10000)
         try:
-            self.page.wait_for_function(
+            outcome = self.page.wait_for_function(
                 """() => {
+                    const visible = element => !!element && !!(element.offsetWidth || element.offsetHeight);
+                    if ([...document.querySelectorAll('.cdk-overlay-pane .table-row')].some(visible)) return 'offers';
+                    if ([...document.querySelectorAll('button')].some(button => visible(button) && /^\\s*RETRY\\s*$/i.test(button.innerText || ''))) return 'retry';
+                    const body = document.body?.innerText || '';
+                    if (/No part lines to source|Source parts\\s*:?\\s*0|0\\s+source parts|Enter part price/i.test(body)) return 'no-source';
                     const tab = document.querySelector('[role="tab"].source-parts-tab');
-                    if (!tab) return 'missing';
-                    return tab.getAttribute('aria-disabled') === 'false' ? 'enabled' : 'disabled';
+                    if (tab && tab.getAttribute('aria-disabled') === 'false') return 'enabled';
+                    return false;
                 }""",
-                timeout=15000,
+                timeout=60000,
             ).json_value()
         except PlaywrightTimeoutError:
-            if no_source_parts:
-                log.warning("CCC created the estimate line for OEM %s without sourceable parts; skipping vendor lookup", oem)
-                return None
-            log.warning("CCC kept Source parts disabled for OEM %s; skipping vendor lookup", oem)
-            raise RuntimeError(f"CCC Source parts stayed disabled for OEM {oem}; retry this row") from None
-        source_tab.click()
-        source_tag = self.page.get_by_role("button", name="Show sourced parts").first
-        try:
-            source_tag.wait_for(state="visible", timeout=10000)
-        except PlaywrightTimeoutError as error:
-            body_text = normalize(self.page.locator("body").inner_text())
-            if NO_SOURCE_PARTS_RE.search(body_text):
-                log.info("CCC estimate line for OEM %s has no sourceable parts; skipping vendor lookup", oem)
-                return None
-            raise RuntimeError(f"CCC added no sourceable estimate line for OEM {oem}") from error
-        source_tag.click()
-        return self.wait_for_vendor_inventory()
+            outcome = "timeout"
+        if outcome == "offers":
+            return 0
+        if outcome == "no-source":
+            return None
+        if outcome == "enabled":
+            self.page.locator('[role="tab"].source-parts-tab').click(timeout=10000)
+            self.page.get_by_role("button", name="Show sourced parts").first.click(timeout=10000)
+            return self.wait_for_vendor_inventory()
+        if outcome == "retry":
+            return None
+        raise RuntimeError(f"CCC Source parts preparation did not recover for OEM {oem} ({outcome})")
 
     def wait_for_vendor_inventory(self) -> int | None:
         retry_count = 0
@@ -918,7 +1081,7 @@ class CCCCrawler:
     def crawl_row(self, record: dict[str, str]) -> dict[str, Any]:
         vin, oem = record["VIN"], record["OEM"]
         self.checkpoint(f"Input row {record['_row']}: VIN={vin}, OEM={oem}")
-        result: dict[str, Any] = {"VIN": vin, "OEM": oem}
+        result: dict[str, Any] = {"Year": "", "Make": "", "Model": "", "VIN": vin, "OEM": oem}
         try:
             if not self._workfile_initialized:
                 self.open_new_workfile()
@@ -929,6 +1092,7 @@ class CCCCrawler:
             if not self.enter_vehicle(vin):
                 result["Status"] = "Vehicle/model not found; skipped"
             else:
+                result.update(self._vehicle_details)
                 retry_count = self.open_part_results(oem)
                 if retry_count is None:
                     body_text = normalize(self.page.locator("body").inner_text())
@@ -941,6 +1105,7 @@ class CCCCrawler:
                 else:
                     offers, market_data = self.read_vendor_inventory()
                     result = self.summarize(vin, oem, offers, self.description_target)
+                    result.update(self._vehicle_details)
                     result["market_data"] = json.dumps(market_data, ensure_ascii=False)
                     log.info("Completed VIN=%s OEM=%s; iPart listed=%s", vin, oem, result["Ipart listed on CCC"])
         except CatalogPartNotFoundError as error:
@@ -1027,10 +1192,11 @@ def main() -> int:
     unfinished = 0
     for record in records:
         key = (record["VIN"], record["OEM"])
-        if saved_remaining[key] > 0:
-            saved_remaining[key] -= 1
-        elif retry_remaining[key] > 0:
+        if retry_remaining[key] > 0:
             retry_remaining[key] -= 1
+            unfinished += 1
+        elif saved_remaining[key] > 0:
+            saved_remaining[key] -= 1
         else:
             unfinished += 1
     if unfinished == 0:
@@ -1055,14 +1221,15 @@ def main() -> int:
             for index, record in enumerate(records, start=1):
                 log.info("Progress: %d/%d", index, len(records))
                 key = (record["VIN"], record["OEM"])
-                if completed[key] > 0:
+                if retry_rows[key]:
+                    result = crawler.crawl_row(record)
+                    results[retry_rows[key].popleft()] = result
+                elif completed[key] > 0:
                     completed[key] -= 1
                     log.info("Skipping row %d; result is already saved", index)
                     continue
-                result = crawler.crawl_row(record)
-                if retry_rows[key]:
-                    results[retry_rows[key].popleft()] = result
                 else:
+                    result = crawler.crawl_row(record)
                     results.append(result)
                 rows_since_save += 1
                 if rows_since_save >= RESULT_SAVE_INTERVAL:
