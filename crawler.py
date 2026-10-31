@@ -106,6 +106,12 @@ def is_no_catalog_results(body_text: str) -> bool:
     return "no results found for search text:" in text
 
 
+def catalog_not_found_error(body_text: str, oem: str) -> CatalogPartNotFoundError | None:
+    if is_no_catalog_results(body_text):
+        return CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
+    return None
+
+
 def parse_price(value: str) -> float | None:
     cleaned = re.sub(r"[^0-9.\-]", "", value.replace(",", ""))
     try:
@@ -218,7 +224,9 @@ def resume_state(results: list[dict[str, Any]]) -> tuple[Counter, dict[tuple[str
         if not all(key):
             continue
         status = str(result.get("Status") or "").strip()
-        if status.upper().startswith("ERROR:"):
+        if status.upper().startswith("ERROR:") or status.casefold().startswith(
+            "no catalog results found for oem "
+        ):
             retry_rows[key].append(index)
         else:
             completed[key] += 1
@@ -708,9 +716,12 @@ class CCCCrawler:
             category_labels = self.page.locator(".part-group-name:visible, .group-list-item:visible, [class*=group-list-item]:visible")
             if not category_labels.count():
                 body_text = normalize(self.page.locator("body").inner_text())
-                if is_no_catalog_results(body_text):
-                    raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}") from error
-                raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}") from error
+                not_found_error = catalog_not_found_error(body_text, oem)
+                if not_found_error is not None:
+                    raise not_found_error from error
+                raise RuntimeError(
+                    f"CCC catalog categories did not load for OEM {oem}; retry required"
+                ) from error
 
         parts = self.page.locator("app-part-selector-part-row:visible")
         body_text = normalize(self.page.locator("body").inner_text())
@@ -799,7 +810,13 @@ class CCCCrawler:
                 if state == "empty":
                     raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
         if not selected_parts or not parts.count():
-            raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem} in any returned category")
+            body_text = normalize(self.page.locator("body").inner_text())
+            not_found_error = catalog_not_found_error(body_text, oem)
+            if not_found_error is not None:
+                raise not_found_error
+            raise RuntimeError(
+                f"CCC catalog categories returned no visible part rows for OEM {oem}; retry required"
+            )
 
         candidate_limit = min(max(2, len(category_names)), max(3, parts.count()))
         for part_index in range(candidate_limit):
