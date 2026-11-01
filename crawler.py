@@ -408,22 +408,93 @@ class CCCCrawler:
     def open_new_workfile(self) -> None:
         if not self.workfiles_url:
             raise RuntimeError("Workfiles list URL is not initialized")
-        if self.page.url != self.workfiles_url:
-            self.page.goto(self.workfiles_url, wait_until="domcontentloaded")
-        self.dismiss_onboarding_guide()
-        self.checkpoint("Creating a new workfile for this input row")
-        self.page.get_by_text("New workfile", exact=True).click(timeout=15000, no_wait_after=True)
-        try:
-            self.page.wait_for_url("**/edit/contacts", wait_until="commit", timeout=45000)
-            self.page.locator('a[aria-label="Vehicle"]').wait_for(state="visible", timeout=45000)
-        except PlaywrightTimeoutError as error:
-            self.capture_failure("new_workfile_surface_not_loaded")
-            raise RuntimeError(
-                f"CCC did not finish opening the workfile Vehicle panel; current URL: {self.page.url}"
-            ) from error
-        self.dismiss_jumpstart_prompt()
-        self._workfile_initialized = True
-        log.info("New workfile opened: %s", self.page.url)
+
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                if attempt > 1:
+                    body_text = ""
+                    try:
+                        body_text = normalize(self.page.locator("body").inner_text())
+                    except PlaywrightError:
+                        pass
+                    if not body_text:
+                        log.warning("CCC workfiles page is blank; rebuilding the browser session (attempt %d/3)", attempt)
+                        self.sign_in_if_needed()
+                        self.workfiles_url = None
+                        self.open_workfiles()
+
+                if self.page.url != self.workfiles_url:
+                    self.page.goto(self.workfiles_url, wait_until="domcontentloaded")
+                else:
+                    current_url = self.page.url
+                    self.page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    if self.page.url != current_url:
+                        self.page.goto(self.workfiles_url, wait_until="domcontentloaded")
+
+                self.dismiss_onboarding_guide()
+                control = self.page.get_by_text("New workfile", exact=True)
+                try:
+                    control.first.wait_for(state="visible", timeout=30000)
+                except PlaywrightTimeoutError:
+                    pass
+                visible_control = self.first_visible(control)
+                if visible_control is None:
+                    log.warning(
+                        "New workfile control not visible (attempt %d/3); reloading workfiles list",
+                        attempt,
+                    )
+                    self.page.goto(self.workfiles_url, wait_until="domcontentloaded", timeout=30000)
+                    try:
+                        self.page.wait_for_function(
+                            "() => document.body && document.body.innerText.trim().length > 100",
+                            timeout=30000,
+                        )
+                    except PlaywrightTimeoutError:
+                        pass
+                    self.page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    self.dismiss_onboarding_guide()
+                    control = self.page.get_by_text("New workfile", exact=True)
+                    try:
+                        control.first.wait_for(state="visible", timeout=30000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    visible_control = self.first_visible(control)
+                if visible_control is None:
+                    raise PlaywrightTimeoutError(
+                        'waiting for get_by_text("New workfile", exact=True)'
+                    )
+
+                self.checkpoint("Creating a new workfile for this input row")
+                visible_control.click(timeout=15000, no_wait_after=True)
+                try:
+                    self.page.wait_for_url("**/edit/contacts", wait_until="commit", timeout=45000)
+                    self.page.locator('a[aria-label="Vehicle"]').wait_for(state="visible", timeout=45000)
+                except PlaywrightTimeoutError as error:
+                    self.capture_failure("new_workfile_surface_not_loaded")
+                    raise RuntimeError(
+                        f"CCC did not finish opening the workfile Vehicle panel; current URL: {self.page.url}"
+                    ) from error
+                self.dismiss_jumpstart_prompt()
+                self._workfile_initialized = True
+                log.info("New workfile opened: %s", self.page.url)
+                return
+            except (PlaywrightError, RuntimeError) as error:
+                last_error = error
+                log.warning(
+                    "New workfile recovery attempt %d/3 failed: %s", attempt, str(error)
+                )
+                self.capture_failure(f"new_workfile_recovery_{attempt}")
+                try:
+                    self.page.goto(self.workfiles_url, wait_until="domcontentloaded", timeout=30000)
+                    self.page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except PlaywrightError:
+                    pass
+
+        assert last_error is not None
+        raise PlaywrightTimeoutError(
+            'New workfile control remained unavailable after 3 workfiles-list reloads'
+        ) from last_error
 
     def dismiss_jumpstart_prompt(self) -> None:
         prompt = self.page.locator(".cdk-overlay-pane").filter(
@@ -517,16 +588,24 @@ class CCCCrawler:
         return True
 
     def resolve_vehicle_change_state(self, workfile_url: str) -> str:
-        state = self.wait_for_vehicle_selection_state()
+        try:
+            state = self.wait_for_vehicle_selection_state()
+        except PlaywrightError as error:
+            if self.page.is_closed() or "closed" in str(error).lower() or "target" in str(error).lower():
+                self.reopen_workfile_page(workfile_url)
+                state = self.wait_for_vehicle_selection_state()
+            else:
+                raise
         while state == "change-confirmation":
             self.confirm_change_vehicle()
             try:
                 state = self.wait_for_vehicle_selection_state()
             except PlaywrightError as error:
-                if not self.page.is_closed() and "closed" not in str(error).lower():
+                if self.page.is_closed() or "closed" in str(error).lower() or "target" in str(error).lower():
+                    self.reopen_workfile_page(workfile_url)
+                    state = self.wait_for_vehicle_selection_state()
+                else:
                     raise
-                self.reopen_workfile_page(workfile_url)
-                state = self.wait_for_vehicle_selection_state()
         return state
 
     def wait_for_vehicle_selection_state(self) -> str:
