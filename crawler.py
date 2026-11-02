@@ -224,9 +224,7 @@ def resume_state(results: list[dict[str, Any]]) -> tuple[Counter, dict[tuple[str
         if not all(key):
             continue
         status = str(result.get("Status") or "").strip()
-        if status.upper().startswith("ERROR:") or status.casefold().startswith(
-            "no catalog results found for oem "
-        ):
+        if status.casefold() != "ok":
             retry_rows[key].append(index)
         else:
             completed[key] += 1
@@ -1044,6 +1042,27 @@ class CCCCrawler:
                 return None
 
             if outcome == "offers":
+                self.page.evaluate("() => { window.__cccVendorInventoryStability = null; }")
+                try:
+                    self.page.wait_for_function(
+                        """() => {
+                            const visible = element => !!element && !!(element.offsetWidth || element.offsetHeight);
+                            const rows = [...document.querySelectorAll('.cdk-overlay-pane .table-row')].filter(visible);
+                            if (!rows.length) return false;
+                            const signature = rows.map(row => row.innerText).join('\\n');
+                            const now = performance.now();
+                            const previous = window.__cccVendorInventoryStability;
+                            if (!previous || previous.signature !== signature) {
+                                window.__cccVendorInventoryStability = { signature, startedAt: now };
+                                return false;
+                            }
+                            return now - previous.startedAt >= 1500;
+                        }""",
+                        timeout=8000,
+                        polling=250,
+                    )
+                except PlaywrightTimeoutError:
+                    log.warning("CCC vendor inventory kept changing; reading currently visible rows")
                 return retry_count
             retry_control = self.first_visible(retry_button)
             if retry_control is None:
