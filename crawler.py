@@ -42,6 +42,7 @@ OUTPUT_COLUMNS = [
 IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
 MAX_VENDOR_SEARCH_RETRIES = 3
+MAX_ROW_RETRIES = 1
 RESULT_SAVE_INTERVAL = 1
 RECALL_NOTICE_DETECT_TIMEOUT_MS = 1000
 MODEL_MISMATCH_RE = re.compile(
@@ -101,13 +102,50 @@ def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip().casefold()
 
 
+def description_matches_target(description: str, target: str) -> bool:
+    normalized_description = normalize(description)
+    normalized_target = normalize(target)
+    if normalized_target in normalized_description:
+        return True
+    target_tokens = set(re.findall(r"[a-z0-9]+", normalized_target))
+    description_tokens = set(re.findall(r"[a-z0-9]+", normalized_description))
+    return bool(target_tokens) and target_tokens.issubset(description_tokens)
+
+
+def market_data_matches_target(market_data: Any, target: str) -> bool:
+    if isinstance(market_data, str):
+        try:
+            market_data = json.loads(market_data)
+        except json.JSONDecodeError:
+            return False
+    return isinstance(market_data, list) and any(
+        isinstance(row, dict)
+        and description_matches_target(str(row.get("description") or ""), target)
+        for row in market_data
+    )
+
+
+def should_retry_row_status(status: str) -> bool:
+    normalized_status = (status or "").strip().casefold()
+    return normalized_status.startswith((
+        "error:",
+        "no catalog results found for oem ",
+        "no sourceable parts available",
+        "vendor search failed",
+    ))
+
+
 def is_no_catalog_results(body_text: str) -> bool:
     text = normalize(body_text)
     return "no results found for search text:" in text
 
 
-def catalog_not_found_error(body_text: str, oem: str) -> CatalogPartNotFoundError | None:
-    if is_no_catalog_results(body_text):
+def catalog_not_found_error(
+    body_text: str,
+    oem: str,
+    visible_category_count: int = 0,
+) -> CatalogPartNotFoundError | None:
+    if visible_category_count == 0 and is_no_catalog_results(body_text):
         return CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
     return None
 
@@ -216,7 +254,10 @@ def load_results(path: Path) -> list[dict[str, Any]]:
         workbook.close()
 
 
-def resume_state(results: list[dict[str, Any]]) -> tuple[Counter, dict[tuple[str, str], deque[int]]]:
+def resume_state(
+    results: list[dict[str, Any]],
+    description_target: str = TARGET_DESCRIPTION,
+) -> tuple[Counter, dict[tuple[str, str], deque[int]]]:
     completed: Counter = Counter()
     retry_rows: dict[tuple[str, str], deque[int]] = defaultdict(deque)
     for index, result in enumerate(results):
@@ -224,10 +265,18 @@ def resume_state(results: list[dict[str, Any]]) -> tuple[Counter, dict[tuple[str
         if not all(key):
             continue
         status = str(result.get("Status") or "").strip()
-        if status.casefold() != "ok":
-            retry_rows[key].append(index)
-        else:
+        saved_market_has_target = market_data_matches_target(
+            result.get("market_data"), description_target
+        )
+        completed_no_match = (
+            status.casefold().startswith("no offers matching description:")
+            and bool(result.get("market_data"))
+            and not saved_market_has_target
+        )
+        if status.casefold() == "ok" or completed_no_match:
             completed[key] += 1
+        else:
+            retry_rows[key].append(index)
     return completed, retry_rows
 
 
@@ -802,8 +851,9 @@ class CCCCrawler:
 
         parts = self.page.locator("app-part-selector-part-row:visible")
         body_text = normalize(self.page.locator("body").inner_text())
-        if is_no_catalog_results(body_text):
-            raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
+        not_found_error = catalog_not_found_error(body_text, oem, categories.count())
+        if not_found_error is not None:
+            raise not_found_error
         category_names = categories.all_inner_texts() if categories.count() else []
         if not category_names:
             category_names = [
@@ -813,9 +863,6 @@ class CCCCrawler:
             ]
         selected_parts = False
         for category_name in category_names:
-            body_text = normalize(self.page.locator("body").inner_text())
-            if is_no_catalog_results(body_text):
-                raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
             visible_categories = self.page.locator("button.group-list-item:visible")
             matching_category = None
             for index in range(visible_categories.count()):
@@ -841,10 +888,7 @@ class CCCCrawler:
                 selected_parts = True
             except PlaywrightTimeoutError:
                 pass
-            body_text = normalize(self.page.locator("body").inner_text())
-            if is_no_catalog_results(body_text):
-                raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
-            for _ in range(10):
+            while True:
                 if selected_parts or parts.count():
                     selected_parts = True
                     break
@@ -866,9 +910,6 @@ class CCCCrawler:
                     continue
             if selected_parts:
                 break
-            no_results = self.page.get_by_text(re.compile(r"No results found for search text:", re.I))
-            if self.first_visible(no_results) is not None:
-                raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
             selected_group = self.page.locator("button.selected-group-button:visible")
             if selected_group.count():
                 selected_group.click(force=True)
@@ -884,8 +925,6 @@ class CCCCrawler:
                     ).json_value()
                 except PlaywrightTimeoutError:
                     state = None
-                if state == "empty":
-                    raise CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
         if not selected_parts or not parts.count():
             body_text = normalize(self.page.locator("body").inner_text())
             not_found_error = catalog_not_found_error(body_text, oem)
@@ -1173,7 +1212,10 @@ class CCCCrawler:
         offers: list[PartOffer],
         description_target: str = TARGET_DESCRIPTION,
     ) -> dict[str, Any]:
-        matching_offers = [offer for offer in offers if normalize(description_target) in normalize(offer.description)]
+        matching_offers = [
+            offer for offer in offers
+            if description_matches_target(offer.description, description_target)
+        ]
         ipart = [offer for offer in matching_offers if normalize(offer.vendor) == normalize(IPART_VENDOR)]
         ipart_available = bool(ipart)
         sorted_all = sorted(matching_offers, key=lambda offer: offer.total)
@@ -1193,7 +1235,11 @@ class CCCCrawler:
             "Status": "OK" if matching_offers else f"No offers matching description: {description_target}",
         }
 
-    def crawl_row(self, record: dict[str, str]) -> dict[str, Any]:
+    def crawl_row(
+        self,
+        record: dict[str, str],
+        retry_attempt: int = 0,
+    ) -> dict[str, Any]:
         vin, oem = record["VIN"], record["OEM"]
         self.checkpoint(f"Input row {record['_row']}: VIN={vin}, OEM={oem}")
         result: dict[str, Any] = {"Year": "", "Make": "", "Model": "", "VIN": vin, "OEM": oem}
@@ -1261,6 +1307,18 @@ class CCCCrawler:
                 self._workfile_initialized = False
         finally:
             result["date_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if should_retry_row_status(str(result.get("Status") or "")):
+            self._workfile_initialized = False
+            if retry_attempt < MAX_ROW_RETRIES:
+                log.warning(
+                    "Retrying VIN=%s OEM=%s in a fresh workfile (%d/%d) after: %s",
+                    vin,
+                    oem,
+                    retry_attempt + 1,
+                    MAX_ROW_RETRIES,
+                    result["Status"],
+                )
+                return self.crawl_row(record, retry_attempt + 1)
         return result
 
 
@@ -1299,7 +1357,7 @@ def main() -> int:
     results = load_results(args.output) if args.resume else []
     if args.resume:
         log.info("Resume enabled: loaded %d saved result row(s) from %s", len(results), args.output)
-    completed, retry_rows = resume_state(results)
+    completed, retry_rows = resume_state(results, args.description)
     if results:
         log.info("Loaded %d saved result(s) from %s", len(results), args.output)
     saved_remaining = completed.copy()
