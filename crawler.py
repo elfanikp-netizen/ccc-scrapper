@@ -43,6 +43,7 @@ IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
 MAX_VENDOR_SEARCH_RETRIES = 3
 MAX_ROW_RETRIES = 1
+MAX_CATALOG_CANDIDATE_RETRIES = 20
 RESULT_SAVE_INTERVAL = 1
 RECALL_NOTICE_DETECT_TIMEOUT_MS = 1000
 MODEL_MISMATCH_RE = re.compile(
@@ -50,7 +51,7 @@ MODEL_MISMATCH_RE = re.compile(
     re.I,
 )
 NO_SOURCE_PARTS_RE = re.compile(
-    r"no part lines to source|source parts\s*[:\-]?\s*0|0\s*source parts|enter part price",
+    r"no part lines to source",
     re.I,
 )
 VEHICLE_TITLE_RE = re.compile(
@@ -299,6 +300,7 @@ class CCCCrawler:
         self.workfiles_url: str | None = None
         self._workfile_initialized = False
         self._vehicle_details: dict[str, str] = {"Year": "", "Make": "", "Model": ""}
+        self.no_sourceable_candidates = False
         self.artifacts.mkdir(parents=True, exist_ok=True)
 
     def checkpoint(self, label: str) -> None:
@@ -796,7 +798,14 @@ class CCCCrawler:
         visible_control.click()
         self.page.get_by_text(re.compile("Print recall notice", re.I)).wait_for(state="hidden", timeout=10000)
 
-    def open_part_results(self, oem: str) -> int | None:
+    def open_part_results(
+        self,
+        oem: str,
+        attempted_catalog_parts: set[tuple[str, int]] | None = None,
+    ) -> int | None:
+        if attempted_catalog_parts is None:
+            attempted_catalog_parts = set()
+            self.no_sourceable_candidates = False
         self.checkpoint(f"Estimate: searching OEM {oem}")
         self.dismiss_jumpstart_prompt()
         self.page.locator('a[aria-label="Estimate"]').click()
@@ -835,6 +844,17 @@ class CCCCrawler:
             if cancel is not None:
                 cancel.click(timeout=5000)
             raise RuntimeError(f"CCC OEM filter could not confirm {oem} with its OK button: {error}") from error
+        source_tab = self.page.locator("[role=tab].source-parts-tab")
+        source_tag = self.page.get_by_role("button", name="Show sourced parts").first
+        if (
+            source_tab.count()
+            and source_tab.get_attribute("aria-disabled") == "false"
+            and source_tag.is_visible()
+        ):
+            self.checkpoint(f"Source parts are ready after OEM search for {oem}; opening them directly")
+            source_tab.click()
+            source_tag.click()
+            return self.wait_for_vendor_inventory()
         categories = self.page.locator("button.group-list-item:visible")
         try:
             categories.first.wait_for(state="visible", timeout=5000)
@@ -862,6 +882,7 @@ class CCCCrawler:
                 if text.strip() and text.strip().isupper() and len(text.strip()) < 80
             ]
         selected_parts = False
+        selected_category_name = ""
         for category_name in category_names:
             visible_categories = self.page.locator("button.group-list-item:visible")
             matching_category = None
@@ -909,7 +930,13 @@ class CCCCrawler:
                 except PlaywrightTimeoutError:
                     continue
             if selected_parts:
-                break
+                if any(
+                    (normalize(category_name), index) not in attempted_catalog_parts
+                    for index in range(parts.count())
+                ):
+                    selected_category_name = category_name
+                    break
+                selected_parts = False
             selected_group = self.page.locator("button.selected-group-button:visible")
             if selected_group.count():
                 selected_group.click(force=True)
@@ -926,6 +953,9 @@ class CCCCrawler:
                 except PlaywrightTimeoutError:
                     state = None
         if not selected_parts or not parts.count():
+            if attempted_catalog_parts:
+                self.no_sourceable_candidates = True
+                return None
             body_text = normalize(self.page.locator("body").inner_text())
             not_found_error = catalog_not_found_error(body_text, oem)
             if not_found_error is not None:
@@ -934,8 +964,11 @@ class CCCCrawler:
                 f"CCC catalog categories returned no visible part rows for OEM {oem}; retry required"
             )
 
-        candidate_limit = min(max(2, len(category_names)), max(3, parts.count()))
+        candidate_limit = parts.count()
         for part_index in range(candidate_limit):
+            candidate_key = (normalize(selected_category_name), part_index)
+            if candidate_key in attempted_catalog_parts:
+                continue
             candidate = parts.nth(part_index)
             if not candidate.count():
                 break
@@ -947,21 +980,35 @@ class CCCCrawler:
                     raise
                 continue
             self.resolve_part_prompts()
-            self.dismiss_enter_part_price_prompt()
+            price_prompt_acknowledged = self.dismiss_enter_part_price_prompt()
+            if price_prompt_acknowledged:
+                source_tab = self.page.locator("[role=tab].source-parts-tab")
+                source_tab.wait_for(state="visible", timeout=10000)
+                self.checkpoint(f"Opening Source parts after accepting the price prompt for OEM {oem}")
+                source_tab.click(timeout=10000)
+                source_tag = self.page.get_by_role("button", name="Show sourced parts").first
+                source_tag.wait_for(state="visible", timeout=10000)
+                source_tag.click()
+                return self.wait_for_vendor_inventory()
             body_text = normalize(self.page.locator("body").inner_text())
             no_source_parts = bool(NO_SOURCE_PARTS_RE.search(body_text))
             source_tab = self.page.locator("[role=tab].source-parts-tab")
             if not source_tab.count() and no_source_parts:
                 log.info("Catalog part %s for OEM %s is non-sourceable; trying the next catalog match", part_index + 1, oem)
-                continue
+                self.no_sourceable_candidates = True
+                attempted_catalog_parts.add(candidate_key)
+                return None
             try:
                 source_tab.wait_for(state="visible", timeout=10000)
             except PlaywrightTimeoutError:
                 if no_source_parts:
                     log.info("Catalog part %s for OEM %s is non-sourceable; trying the next catalog match", part_index + 1, oem)
-                    continue
+                    self.no_sourceable_candidates = True
+                    attempted_catalog_parts.add(candidate_key)
+                    return None
                 if part_index + 1 < candidate_limit:
-                    continue
+                    attempted_catalog_parts.add(candidate_key)
+                    return None
                 raise RuntimeError(f"Part selection did not complete for OEM {oem}; Source parts tab never appeared") from None
             try:
                 enabled = self.page.wait_for_function(
@@ -978,9 +1025,12 @@ class CCCCrawler:
                 body_text = normalize(self.page.locator("body").inner_text())
                 if no_source_parts or NO_SOURCE_PARTS_RE.search(body_text):
                     log.info("Catalog part %s for OEM %s has no sourceable estimate line; trying the next catalog match", part_index + 1, oem)
-                    continue
+                    self.no_sourceable_candidates = True
+                    attempted_catalog_parts.add(candidate_key)
+                    return None
                 if part_index + 1 < candidate_limit:
-                    continue
+                    attempted_catalog_parts.add(candidate_key)
+                    return None
                 log.warning("CCC Source parts tab is %s for OEM %s; retrying the estimate line", enabled, oem)
                 return self.retry_source_parts(oem)
             source_tab.click()
@@ -991,37 +1041,56 @@ class CCCCrawler:
                 body_text = normalize(self.page.locator("body").inner_text())
                 if NO_SOURCE_PARTS_RE.search(body_text):
                     log.info("Catalog part %s for OEM %s has no sourceable estimate line; trying the next catalog match", part_index + 1, oem)
-                    continue
+                    self.no_sourceable_candidates = True
+                    attempted_catalog_parts.add(candidate_key)
+                    return None
                 if part_index + 1 < candidate_limit:
-                    continue
+                    attempted_catalog_parts.add(candidate_key)
+                    return None
                 raise RuntimeError(f"CCC added no sourceable estimate line for OEM {oem}") from error
             source_tag.click()
             result = self.wait_for_vendor_inventory()
             if result is not None:
                 return result
             if part_index + 1 < candidate_limit:
-                continue
+                attempted_catalog_parts.add(candidate_key)
+                return None
             return None
 
+        if attempted_catalog_parts:
+            self.no_sourceable_candidates = True
         return None
 
-    def dismiss_enter_part_price_prompt(self) -> None:
-        prompt = self.page.get_by_text(re.compile(r"^\s*Enter part price\.?\s*$", re.I)).first
+    def dismiss_enter_part_price_prompt(self) -> bool:
+        prompt = self.page.get_by_text(
+            re.compile(r"^\s*['\"“”‘’]?\s*Enter part price\.?\s*['\"“”‘’]?\s*$", re.I)
+        ).first
         try:
             prompt.wait_for(state="visible", timeout=1500)
         except PlaywrightTimeoutError:
-            return
+            return False
         dialog = self.page.locator(".cdk-overlay-pane").filter(has_text=re.compile(r"Enter part price", re.I)).last
-        ok_button = dialog.get_by_role("button", name=re.compile(r"^\s*OK\s*$", re.I))
-        button = self.first_visible(ok_button)
-        if button is None:
-            button = self.first_visible(dialog.get_by_text(re.compile(r"^\s*OK\s*$", re.I)))
+        ok_pattern = re.compile(r"^\s*OK\s*$", re.I)
+        prompt_container = prompt.locator("xpath=ancestor::*[.//button[normalize-space(.)='OK']][1]")
+        button = None
+        for candidate in (
+            dialog.get_by_role("button", name=ok_pattern),
+            dialog.get_by_text(ok_pattern),
+            prompt_container.get_by_role("button", name=ok_pattern),
+            prompt_container.get_by_text(ok_pattern),
+            self.page.get_by_role("button", name=ok_pattern),
+            self.page.get_by_text(ok_pattern),
+        ):
+            button = self.first_visible(candidate)
+            if button is not None:
+                break
         if button is None:
             self.capture_failure("enter_part_price_ok_not_found")
             raise RuntimeError("CCC's Enter part price prompt appeared without a visible OK control")
         self.checkpoint("CCC Enter part price prompt shown; acknowledging with OK")
         button.click(timeout=10000)
         prompt.wait_for(state="hidden", timeout=10000)
+        return True
 
     def retry_source_parts(self, oem: str) -> int | None:
         retry_button = self.first_visible(
@@ -1038,7 +1107,7 @@ class CCCCrawler:
                     if ([...document.querySelectorAll('.cdk-overlay-pane .table-row')].some(visible)) return 'offers';
                     if ([...document.querySelectorAll('button')].some(button => visible(button) && /^\\s*RETRY\\s*$/i.test(button.innerText || ''))) return 'retry';
                     const body = document.body?.innerText || '';
-                    if (/No part lines to source|Source parts\\s*:?\\s*0|0\\s+source parts|Enter part price/i.test(body)) return 'no-source';
+                    if (/No part lines to source/i.test(body)) return 'no-source';
                     const tab = document.querySelector('[role="tab"].source-parts-tab');
                     if (tab && tab.getAttribute('aria-disabled') === 'false') return 'enabled';
                     return false;
@@ -1122,7 +1191,7 @@ class CCCCrawler:
                 self.page.wait_for_function(
                     """() => {
                         const text = (document.body?.innerText || '').toLowerCase();
-                        return (text.includes('part does not match') && (text.includes('model') || text.includes('year')))
+                        return (text.includes('part does not match') && (text.includes('model') || text.includes('engine') || text.includes('year')))
                             || text.includes('refinish this part')
                             || text.includes('select additional labor')
                             || text.includes('removing duplicate part');
@@ -1133,9 +1202,27 @@ class CCCCrawler:
                 return
             prompt = normalize(self.page.locator("body").inner_text())
             if MODEL_MISMATCH_RE.search(prompt):
-                self.page.get_by_role("button", name=re.compile("^Yes$", re.I)).last.click()
+                mismatch_prompt = self.page.get_by_text(MODEL_MISMATCH_RE).last
+                prompt_container = mismatch_prompt.locator(
+                    "xpath=ancestor::*[.//button[normalize-space(.)='Yes']][1]"
+                )
+                yes_pattern = re.compile(r"^\s*YES\s*$", re.I)
+                yes_button = None
+                for candidate in (
+                    prompt_container.get_by_role("button", name=yes_pattern),
+                    prompt_container.get_by_text(yes_pattern),
+                    self.page.get_by_role("button", name=yes_pattern),
+                    self.page.get_by_text(yes_pattern),
+                ):
+                    yes_button = self.first_visible(candidate)
+                    if yes_button is not None:
+                        break
+                if yes_button is None:
+                    self.capture_failure("model_mismatch_yes_not_found")
+                    raise RuntimeError("CCC's model-mismatch prompt appeared without a visible Yes control")
+                yes_button.click(timeout=10000)
                 self.checkpoint("Accepted CCC model-mismatch confirmation for the selected part")
-                self.page.get_by_text(MODEL_MISMATCH_RE).wait_for(state="hidden", timeout=10000)
+                mismatch_prompt.wait_for(state="hidden", timeout=10000)
             elif "refinish this part" in prompt:
                 self.page.get_by_role("button", name=re.compile("^No$", re.I)).last.click()
                 self.page.get_by_text(re.compile("Refinish this part", re.I)).wait_for(state="hidden", timeout=10000)
@@ -1243,6 +1330,7 @@ class CCCCrawler:
         vin, oem = record["VIN"], record["OEM"]
         self.checkpoint(f"Input row {record['_row']}: VIN={vin}, OEM={oem}")
         result: dict[str, Any] = {"Year": "", "Make": "", "Model": "", "VIN": vin, "OEM": oem}
+        self.no_sourceable_candidates = False
         try:
             if not self._workfile_initialized:
                 self.open_new_workfile()
@@ -1254,10 +1342,36 @@ class CCCCrawler:
                 result["Status"] = "Vehicle/model not found; skipped"
             else:
                 result.update(self._vehicle_details)
-                retry_count = self.open_part_results(oem)
+                attempted_catalog_parts: set[tuple[str, int]] = set()
+                retry_count = self.open_part_results(oem, attempted_catalog_parts)
+                for candidate_attempt in range(1, MAX_CATALOG_CANDIDATE_RETRIES):
+                    if retry_count is not None or not self.no_sourceable_candidates:
+                        break
+                    log.info(
+                        "Trying the next untested catalog option for VIN=%s OEM=%s (%d/%d)",
+                        vin,
+                        oem,
+                        candidate_attempt,
+                        MAX_CATALOG_CANDIDATE_RETRIES - 1,
+                    )
+                    self._workfile_initialized = False
+                    self.open_new_workfile()
+                    if not self.enter_vehicle(vin):
+                        retry_count = None
+                        break
+                    result.update(self._vehicle_details)
+                    previous_candidate_count = len(attempted_catalog_parts)
+                    retry_count = self.open_part_results(oem, attempted_catalog_parts)
+                    if len(attempted_catalog_parts) == previous_candidate_count:
+                        log.info(
+                            "No new catalog options appeared for VIN=%s OEM=%s; stopping candidate retries",
+                            vin,
+                            oem,
+                        )
+                        break
                 if retry_count is None:
                     body_text = normalize(self.page.locator("body").inner_text())
-                    if NO_SOURCE_PARTS_RE.search(body_text):
+                    if self.no_sourceable_candidates or NO_SOURCE_PARTS_RE.search(body_text):
                         result["Status"] = "No sourceable parts available; skipped"
                         log.warning("Skipping VIN=%s OEM=%s: CCC added the estimate line but no sourceable parts were available", vin, oem)
                     else:
