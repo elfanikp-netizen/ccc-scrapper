@@ -38,6 +38,7 @@ OUTPUT_COLUMNS = [
     "Status",
     "date_time",
     "market_data",
+    "Description Target",
 ]
 IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
@@ -269,8 +270,11 @@ def resume_state(
         saved_market_has_target = market_data_matches_target(
             result.get("market_data"), description_target
         )
+        saved_target = normalize(str(result.get("Description Target") or ""))
+        target_matches = not saved_target or saved_target == normalize(description_target)
         completed_no_match = (
             status.casefold().startswith("no offers matching description:")
+            and target_matches
             and bool(result.get("market_data"))
             and not saved_market_has_target
         )
@@ -279,6 +283,54 @@ def resume_state(
         else:
             retry_rows[key].append(index)
     return completed, retry_rows
+
+
+def prepare_result_slots(
+    records: list[dict[str, str]],
+    saved_results: list[dict[str, Any]],
+    description_target: str = TARGET_DESCRIPTION,
+) -> tuple[list[dict[str, Any] | None], dict[tuple[str, str], list[int]]]:
+    """Align saved row occurrences with input order and collect rows needing lookup."""
+    saved_by_key: dict[tuple[str, str], deque[tuple[int, dict[str, Any]]]] = defaultdict(deque)
+    for index, result in enumerate(saved_results):
+        key = (str(result.get("VIN") or "").strip(), str(result.get("OEM") or "").strip())
+        if all(key):
+            saved_by_key[key].append((index, result))
+
+    slots: list[dict[str, Any] | None] = [None] * len(records)
+    pending: dict[tuple[str, str, str], list[int]] = defaultdict(list)
+    input_groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index, record in enumerate(records):
+        row_key = (record["VIN"], record["OEM"])
+        input_groups[row_key].append(index)
+    for row_key, indexes in input_groups.items():
+        group_key = (*row_key, normalize(description_target))
+        saved_rows = list(saved_by_key[row_key])
+        valid_saved = next(
+            (result for _, result in saved_rows
+             if resume_state([result], description_target)[0][row_key] > 0),
+            None,
+        )
+        if valid_saved is not None:
+            for index in indexes:
+                slots[index] = valid_saved
+        else:
+            pending[group_key].extend(indexes)
+    return slots, pending
+
+
+def expand_group_result(
+    result: dict[str, Any],
+    records: list[dict[str, str]],
+    indexes: list[int],
+) -> list[dict[str, Any]]:
+    expanded = []
+    for index in indexes:
+        row = dict(result)
+        row["VIN"] = records[index]["VIN"]
+        row["OEM"] = records[index]["OEM"]
+        expanded.append(row)
+    return expanded
 
 
 class CCCCrawler:
@@ -1421,6 +1473,7 @@ class CCCCrawler:
                 self._workfile_initialized = False
         finally:
             result["date_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        result["Description Target"] = self.description_target
         if should_retry_row_status(str(result.get("Status") or "")):
             self._workfile_initialized = False
             if retry_attempt < MAX_ROW_RETRIES:
@@ -1471,22 +1524,10 @@ def main() -> int:
     results = load_results(args.output) if args.resume else []
     if args.resume:
         log.info("Resume enabled: loaded %d saved result row(s) from %s", len(results), args.output)
-    completed, retry_rows = resume_state(results, args.description)
     if results:
         log.info("Loaded %d saved result(s) from %s", len(results), args.output)
-    saved_remaining = completed.copy()
-    retry_remaining = Counter({key: len(indexes) for key, indexes in retry_rows.items()})
-    unfinished = 0
-    for record in records:
-        key = (record["VIN"], record["OEM"])
-        if retry_remaining[key] > 0:
-            retry_remaining[key] -= 1
-            unfinished += 1
-        elif saved_remaining[key] > 0:
-            saved_remaining[key] -= 1
-        else:
-            unfinished += 1
-    if unfinished == 0:
+    result_slots, pending_groups = prepare_result_slots(records, results, args.description)
+    if not pending_groups:
         log.info("All %d input rows already have saved results", len(records))
         return 0
 
@@ -1500,36 +1541,27 @@ def main() -> int:
         page = context.new_page()
         page.route("**/*", block_nonessential_resources)
         crawler = CCCCrawler(page, username, password, Path("artifacts"), args.description, context)
-        rows_since_save = 0
         try:
             crawler.sign_in_if_needed()
             context.storage_state(path=str(AUTH_STATE))
             crawler.open_workfiles()
-            for index, record in enumerate(records, start=1):
-                log.info("Progress: %d/%d", index, len(records))
-                key = (record["VIN"], record["OEM"])
-                if retry_rows[key]:
-                    result = crawler.crawl_row(record)
-                    results[retry_rows[key].popleft()] = result
-                elif completed[key] > 0:
-                    completed[key] -= 1
-                    log.info("Skipping row %d; result is already saved", index)
-                    continue
-                else:
-                    result = crawler.crawl_row(record)
-                    results.append(result)
-                rows_since_save += 1
-                if rows_since_save >= RESULT_SAVE_INTERVAL:
-                    save_results(args.output, results)
-                    rows_since_save = 0
-                    log.info("Saved progress to %s", args.output)
-            if rows_since_save:
-                save_results(args.output, results)
-                log.info("Saved final progress to %s", args.output)
+            for group_number, (key, indexes) in enumerate(pending_groups.items(), start=1):
+                first_index = indexes[0]
+                log.info(
+                    "Progress: lookup %d/%d for %d matching input row(s)",
+                    group_number,
+                    len(pending_groups),
+                    len(indexes),
+                )
+                result = crawler.crawl_row(records[first_index])
+                for index, expanded in zip(indexes, expand_group_result(result, records, indexes)):
+                    result_slots[index] = expanded
+                save_results(args.output, [row for row in result_slots if row is not None])
+                log.info("Saved progress to %s", args.output)
         except Exception as error:
             log.exception("Crawler stopped before completing all rows: %s", error)
             try:
-                save_results(args.output, results)
+                save_results(args.output, [row for row in result_slots if row is not None])
             except Exception:
                 log.exception("Could not save partial results to %s", args.output)
             try:
