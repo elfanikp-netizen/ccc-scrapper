@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,14 @@ MAX_ROW_RETRIES = 1
 MAX_CATALOG_CANDIDATE_RETRIES = 20
 RESULT_SAVE_INTERVAL = 1
 RECALL_NOTICE_DETECT_TIMEOUT_MS = 1000
+CATALOG_QUICK_WAIT_MS = 1500
+CATALOG_LOADING_WAIT_MS = 15000
+CATALOG_SCAN_TIMEOUT_SECONDS = 300
+CATALOG_LOADING_SELECTOR = (
+    "[aria-busy='true']:visible, [role='progressbar']:visible, "
+    "mat-progress-spinner:visible, mat-spinner:visible, "
+    ".loading-spinner:visible, .spinner:visible"
+)
 MODEL_MISMATCH_RE = re.compile(
     r"part does not match (?:(?:the )?(?:year[, ]+)?(?:model|engine)(?: of the vehicle)?|the year of the vehicle)",
     re.I,
@@ -86,6 +95,10 @@ class PartOffer:
 
 
 class CatalogPartNotFoundError(RuntimeError):
+    pass
+
+
+class CatalogSearchTimeoutError(RuntimeError):
     pass
 
 
@@ -131,7 +144,6 @@ def should_retry_row_status(status: str) -> bool:
     normalized_status = (status or "").strip().casefold()
     return normalized_status.startswith((
         "error:",
-        "no catalog results found for oem ",
         "no sourceable parts available",
         "vendor search failed",
     ))
@@ -147,7 +159,15 @@ def catalog_not_found_error(
     oem: str,
     visible_category_count: int = 0,
 ) -> CatalogPartNotFoundError | None:
-    if visible_category_count == 0 and is_no_catalog_results(body_text):
+    if not is_no_catalog_results(body_text):
+        return None
+    result = re.search(
+        r"no results found for search text:\s*[\"']?([^\s\"';]+)",
+        normalize(body_text),
+    )
+    if result and normalize(result.group(1).rstrip(".,:)!?")) == normalize(oem):
+        return CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
+    if visible_category_count == 0 and result is None:
         return CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
     return None
 
@@ -273,10 +293,13 @@ def resume_state(
         saved_target = normalize(str(result.get("Description Target") or ""))
         target_matches = not saved_target or saved_target == normalize(description_target)
         completed_no_match = (
-            status.casefold().startswith("no offers matching description:")
-            and target_matches
-            and bool(result.get("market_data"))
-            and not saved_market_has_target
+            status.casefold().startswith("no catalog results found for oem ")
+            or (
+                status.casefold().startswith("no offers matching description:")
+                and target_matches
+                and bool(result.get("market_data"))
+                and not saved_market_has_target
+            )
         )
         if status.casefold() == "ok" or completed_no_match:
             completed[key] += 1
@@ -357,6 +380,96 @@ class CCCCrawler:
 
     def checkpoint(self, label: str) -> None:
         log.info("%s", label)
+
+    def wait_for_catalog_element(self, locator: Locator, oem: str, action: str) -> bool:
+        try:
+            locator.first.wait_for(state="visible", timeout=CATALOG_QUICK_WAIT_MS)
+            return True
+        except PlaywrightTimeoutError:
+            body_text = normalize(self.page.locator("body").inner_text())
+            not_found_error = catalog_not_found_error(body_text, oem)
+            if not_found_error is not None:
+                raise not_found_error
+
+            loading = self.page.locator(CATALOG_LOADING_SELECTOR)
+            if not loading.count():
+                return bool(locator.count())
+
+            self.checkpoint(f"CCC is still loading while {action}; extending the wait")
+            try:
+                locator.first.wait_for(state="visible", timeout=CATALOG_LOADING_WAIT_MS)
+                return True
+            except PlaywrightTimeoutError as error:
+                body_text = normalize(self.page.locator("body").inner_text())
+                not_found_error = catalog_not_found_error(body_text, oem)
+                if not_found_error is not None:
+                    raise not_found_error from error
+                raise CatalogSearchTimeoutError(
+                    f"CCC remained busy while {action} for OEM {oem}; retry required"
+                ) from error
+
+    @staticmethod
+    def check_catalog_scan_deadline(started_at: float, oem: str) -> None:
+        elapsed = time.monotonic() - started_at
+        if elapsed >= CATALOG_SCAN_TIMEOUT_SECONDS:
+            raise CatalogSearchTimeoutError(
+                f"CCC catalog scan exceeded {CATALOG_SCAN_TIMEOUT_SECONDS} seconds "
+                f"for OEM {oem}; retry required"
+            )
+
+    def load_catalog_categories(self, oem: str) -> tuple[Locator, list[str]]:
+        categories = self.page.locator("button.group-list-item:visible")
+        if not self.wait_for_catalog_element(categories, oem, "loading catalog categories"):
+            selected_group = self.page.locator("button.selected-group-button:visible")
+            if selected_group.count():
+                selected_group.first.click(force=True)
+                self.wait_for_catalog_element(categories, oem, "opening catalog categories")
+
+        category_names = categories.all_inner_texts()
+        if category_names:
+            return categories, category_names
+
+        body_text = normalize(self.page.locator("body").inner_text())
+        not_found_error = catalog_not_found_error(body_text, oem)
+        if not_found_error is not None:
+            raise not_found_error
+        raise CatalogSearchTimeoutError(
+            f"CCC catalog category controls did not load for OEM {oem}; retry required"
+        )
+
+    def select_catalog_category(self, category_name: str, oem: str) -> None:
+        categories = self.page.locator("button.group-list-item:visible")
+        matching_category = None
+        for index in range(categories.count()):
+            candidate = categories.nth(index)
+            if normalize(candidate.inner_text()) == normalize(category_name):
+                matching_category = candidate
+                break
+
+        if matching_category is None:
+            selected_group = self.page.locator("button.selected-group-button:visible")
+            if not selected_group.count():
+                raise CatalogSearchTimeoutError(
+                    f"CCC category menu could not be reopened for OEM {oem}; retry required"
+                )
+            selected_group.first.click(force=True)
+            if not self.wait_for_catalog_element(
+                categories, oem, "reopening catalog categories"
+            ):
+                raise CatalogSearchTimeoutError(
+                    f"CCC category menu did not reopen for OEM {oem}; retry required"
+                )
+            for index in range(categories.count()):
+                candidate = categories.nth(index)
+                if normalize(candidate.inner_text()) == normalize(category_name):
+                    matching_category = candidate
+                    break
+
+        if matching_category is None:
+            raise CatalogSearchTimeoutError(
+                f"CCC category {category_name.strip()} was not available for OEM {oem}; retry required"
+            )
+        matching_category.click(force=True)
 
     @staticmethod
     def first_visible(locator: Locator) -> Locator | None:
@@ -907,60 +1020,26 @@ class CCCCrawler:
             source_tab.click()
             source_tag.click()
             return self.wait_for_vendor_inventory()
-        categories = self.page.locator("button.group-list-item:visible")
-        try:
-            categories.first.wait_for(state="visible", timeout=5000)
-        except PlaywrightTimeoutError as error:
-            category_labels = self.page.locator(".part-group-name:visible, .group-list-item:visible, [class*=group-list-item]:visible")
-            if not category_labels.count():
-                body_text = normalize(self.page.locator("body").inner_text())
-                not_found_error = catalog_not_found_error(body_text, oem)
-                if not_found_error is not None:
-                    raise not_found_error from error
-                raise RuntimeError(
-                    f"CCC catalog categories did not load for OEM {oem}; retry required"
-                ) from error
+        categories, category_names = self.load_catalog_categories(oem)
 
         parts = self.page.locator("app-part-selector-part-row:visible")
         body_text = normalize(self.page.locator("body").inner_text())
         not_found_error = catalog_not_found_error(body_text, oem, categories.count())
         if not_found_error is not None:
             raise not_found_error
-        category_names = categories.all_inner_texts() if categories.count() else []
-        if not category_names:
-            category_names = [
-                text.strip()
-                for text in self.page.locator("body").inner_text().splitlines()
-                if text.strip() and text.strip().isupper() and len(text.strip()) < 80
-            ]
         selected_parts = False
         selected_category_name = ""
+        scan_started_at = time.monotonic()
+        categories_checked = 0
+        subgroups_expanded = 0
         for category_name in category_names:
-            visible_categories = self.page.locator("button.group-list-item:visible")
-            matching_category = None
-            for index in range(visible_categories.count()):
-                candidate = visible_categories.nth(index)
-                if normalize(candidate.inner_text()) == normalize(category_name):
-                    matching_category = candidate
-                    break
+            self.check_catalog_scan_deadline(scan_started_at, oem)
             self.checkpoint(f"Checking catalog category {category_name.strip()}")
-            if matching_category is not None:
-                matching_category.click(force=True)
-            else:
-                category_text = self.page.get_by_text(category_name.strip(), exact=True)
-                visible_text = [
-                    category_text.nth(index)
-                    for index in range(category_text.count())
-                    if category_text.nth(index).is_visible()
-                ]
-                if not visible_text:
-                    continue
-                visible_text[-1].click(force=True)
-            try:
-                parts.first.wait_for(state="visible", timeout=5000)
-                selected_parts = True
-            except PlaywrightTimeoutError:
-                pass
+            self.select_catalog_category(category_name, oem)
+            categories_checked += 1
+            selected_parts = self.wait_for_catalog_element(
+                parts, oem, f"checking catalog category {category_name.strip()}"
+            )
             while True:
                 if selected_parts or parts.count():
                     selected_parts = True
@@ -973,14 +1052,15 @@ class CCCCrawler:
                 ]
                 if not collapsed_subgroups:
                     break
+                self.check_catalog_scan_deadline(scan_started_at, oem)
                 self.checkpoint("Expanding a catalog subgroup")
                 collapsed_subgroups[0].click()
-                try:
-                    parts.first.wait_for(state="visible", timeout=5000)
+                subgroups_expanded += 1
+                if self.wait_for_catalog_element(
+                    parts, oem, f"expanding a catalog subgroup for {category_name.strip()}"
+                ):
                     selected_parts = True
                     break
-                except PlaywrightTimeoutError:
-                    continue
             if selected_parts:
                 if any(
                     (normalize(category_name), index) not in attempted_catalog_parts
@@ -1004,6 +1084,11 @@ class CCCCrawler:
                     ).json_value()
                 except PlaywrightTimeoutError:
                     state = None
+        self.checkpoint(
+            f"Catalog scan for OEM {oem}: checked {categories_checked} categories, "
+            f"expanded {subgroups_expanded} subgroups in "
+            f"{time.monotonic() - scan_started_at:.1f}s"
+        )
         if not selected_parts or not parts.count():
             if attempted_catalog_parts:
                 self.no_sourceable_candidates = True
@@ -1012,8 +1097,9 @@ class CCCCrawler:
             not_found_error = catalog_not_found_error(body_text, oem)
             if not_found_error is not None:
                 raise not_found_error
-            raise RuntimeError(
-                f"CCC catalog categories returned no visible part rows for OEM {oem}; retry required"
+            raise CatalogSearchTimeoutError(
+                f"CCC showed no part rows for OEM {oem} after checking all categories, "
+                "but did not confirm that no results were found; retry required"
             )
 
         candidate_limit = parts.count()
@@ -1374,6 +1460,17 @@ class CCCCrawler:
             "Status": "OK" if matching_offers else f"No offers matching description: {description_target}",
         }
 
+    def recover_closed_page(self) -> None:
+        if self.page.is_closed() is not True:
+            return
+        self.checkpoint("CCC browser tab closed; opening a new tab and restoring the session")
+        self.page = self.context.new_page()
+        self.page.route("**/*", block_nonessential_resources)
+        self.sign_in_if_needed()
+        self.context.storage_state(path=str(AUTH_STATE))
+        self.open_workfiles()
+        self._workfile_initialized = False
+
     def crawl_row(
         self,
         record: dict[str, str],
@@ -1384,6 +1481,7 @@ class CCCCrawler:
         result: dict[str, Any] = {"Year": "", "Make": "", "Model": "", "VIN": vin, "OEM": oem}
         self.no_sourceable_candidates = False
         try:
+            self.recover_closed_page()
             if not self._workfile_initialized:
                 self.open_new_workfile()
             elif not self.page.locator('a[aria-label="Vehicle"]').count():
@@ -1438,8 +1536,24 @@ class CCCCrawler:
         except CatalogPartNotFoundError as error:
             log.warning("Skipping VIN=%s OEM=%s: %s", vin, oem, error)
             result["Status"] = f"{error}; skipped"
-        except FatalCrawlerError:
-            raise
+        except CatalogSearchTimeoutError as error:
+            self._workfile_initialized = False
+            log.warning(
+                "Catalog search did not complete for VIN=%s OEM=%s; continuing after row retry: %s",
+                vin,
+                oem,
+                error,
+            )
+            result["Status"] = f"ERROR: catalog search did not complete: {error}; retry on resume"
+        except FatalCrawlerError as error:
+            self._workfile_initialized = False
+            log.warning(
+                "Unrecoverable CCC row state for VIN=%s OEM=%s; continuing with the next row after retry: %s",
+                vin,
+                oem,
+                error,
+            )
+            result["Status"] = f"ERROR: CCC row state could not be recovered: {error}; retry on resume"
         except Exception as error:
             error_text = str(error).lower()
             browser_closed = self.page.is_closed() or (
@@ -1451,10 +1565,14 @@ class CCCCrawler:
                     self.capture_failure(f"browser_closed_{record['_row']}_{vin}")
                 except PlaywrightError:
                     pass
-                raise FatalCrawlerError(
-                    f"CCC browser closed while processing VIN={vin}, OEM={oem}; stopping crawl to preserve time"
-                ) from error
-            if overlay_blocked:
+                log.warning(
+                    "CCC browser tab closed while processing VIN=%s OEM=%s; the row will be retried and the run will continue",
+                    vin,
+                    oem,
+                )
+                result["Status"] = f"ERROR: CCC browser tab closed: {error}; retry on resume"
+                self._workfile_initialized = False
+            elif overlay_blocked:
                 try:
                     self.capture_failure(f"overlay_blocked_{record['_row']}_{vin}")
                 except PlaywrightError:
