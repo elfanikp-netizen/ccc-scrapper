@@ -3,13 +3,17 @@ from unittest.mock import MagicMock, patch
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from crawler import (
+    CATALOG_LOADING_SELECTOR,
     CCCCrawler,
+    FatalCrawlerError,
+    CatalogSearchTimeoutError,
     MODEL_MISMATCH_RE,
     NO_SOURCE_PARTS_RE,
     PartOffer,
     catalog_not_found_error,
     expand_group_result,
     is_no_catalog_results,
+    remaining_catalog_categories,
     prepare_result_slots,
     resume_state,
     should_retry_row_status,
@@ -53,16 +57,31 @@ class NoCatalogResultsDetectionTests(unittest.TestCase):
     def test_only_explicit_empty_message_is_catalog_not_found(self):
         error = catalog_not_found_error("No results found for search text: CJ5Z13008B", "CJ5Z13008B")
         self.assertEqual(str(error), "No catalog results found for OEM CJ5Z13008B")
+        self.assertEqual(
+            str(catalog_not_found_error(
+                'No results found for search text: "CJ5Z13008B"',
+                "CJ5Z13008B",
+                visible_category_count=47,
+            )),
+            "No catalog results found for OEM CJ5Z13008B",
+        )
         self.assertIsNone(
             catalog_not_found_error(
-                "No results found for search text: CJ5Z13008B",
+                "No results found for search text: DIFFERENTOEM",
                 "CJ5Z13008B",
-                visible_category_count=3,
+                visible_category_count=47,
             )
         )
 
         self.assertIsNone(catalog_not_found_error("", "CJ5Z13008B"))
         self.assertIsNone(catalog_not_found_error("Loading catalog...", "CJ5Z13008B"))
+        self.assertIsNone(
+            catalog_not_found_error(
+                "Source parts 0; generic vehicle categories are visible",
+                "CJ5Z13008B",
+                visible_category_count=47,
+            )
+        )
 
     def test_resume_retries_failures_and_qualified_capa_market_rows(self):
         results = [
@@ -86,7 +105,8 @@ class NoCatalogResultsDetectionTests(unittest.TestCase):
 
         completed, retry_rows = resume_state(results)
 
-        self.assertEqual(list(retry_rows[("VIN1", "OEM1")]), [0])
+        self.assertEqual(completed[("VIN1", "OEM1")], 1)
+        self.assertNotIn(("VIN1", "OEM1"), retry_rows)
         self.assertEqual(list(retry_rows[("VIN2", "OEM2")]), [1])
         self.assertEqual(list(retry_rows[("VIN3", "OEM3")]), [2])
         self.assertEqual(completed[("VIN4", "OEM4")], 1)
@@ -121,14 +141,234 @@ class NoCatalogResultsDetectionTests(unittest.TestCase):
     def test_transient_row_statuses_are_retryable(self):
         for status in (
             "ERROR: catalog categories returned no part rows",
-            "No catalog results found for OEM OEM1; skipped",
             "No sourceable parts available; skipped",
             "Vendor search failed after 3 Retry clicks; skipped",
         ):
             with self.subTest(status=status):
                 self.assertTrue(should_retry_row_status(status))
 
+            self.assertFalse(should_retry_row_status("No catalog results found for OEM OEM1; skipped"))
         self.assertFalse(should_retry_row_status("No offers matching description: A/M: CAPA"))
+
+    def test_wait_for_catalog_element_extends_wait_while_ccc_is_loading(self):
+        page = MagicMock()
+        body = MagicMock()
+        body.inner_text.return_value = "Loading catalog"
+        loading = MagicMock()
+        loading.count.return_value = 1
+        page.locator.side_effect = lambda selector: loading if selector == CATALOG_LOADING_SELECTOR else body
+        locator = MagicMock()
+        locator.first.wait_for.side_effect = [PlaywrightTimeoutError("quick wait"), None]
+        crawler = CCCCrawler(page, "user", "password", MagicMock())
+
+        with patch("crawler.CATALOG_QUICK_WAIT_MS", 10), patch(
+            "crawler.CATALOG_LOADING_WAIT_MS", 25
+        ):
+            self.assertTrue(crawler.wait_for_catalog_element(locator, "OEM1", "checking a category"))
+
+        waits = locator.first.wait_for.call_args_list
+        self.assertEqual(len(waits), 2)
+        self.assertEqual(waits[0].kwargs["timeout"], 10)
+        self.assertEqual(waits[1].kwargs["timeout"], 25)
+
+    def test_wait_for_catalog_element_does_not_extend_without_loading_indicator(self):
+        page = MagicMock()
+        body = MagicMock()
+        body.inner_text.return_value = "Catalog ready"
+        loading = MagicMock()
+        loading.count.return_value = 0
+        page.locator.side_effect = lambda selector: loading if selector == CATALOG_LOADING_SELECTOR else body
+        locator = MagicMock()
+        locator.first.wait_for.side_effect = PlaywrightTimeoutError("quick wait")
+        locator.count.return_value = 0
+        crawler = CCCCrawler(page, "user", "password", MagicMock())
+
+        with patch("crawler.CATALOG_QUICK_WAIT_MS", 10):
+            self.assertFalse(crawler.wait_for_catalog_element(locator, "OEM1", "checking a category"))
+
+        locator.first.wait_for.assert_called_once()
+
+    def test_load_catalog_categories_opens_selected_group_menu(self):
+        page = MagicMock()
+        categories = MagicMock()
+        categories.all_inner_texts.return_value = ["FRONT BUMPER", "FRONT LAMPS"]
+        selected_group = MagicMock()
+        selected_group.count.return_value = 1
+        page.locator.side_effect = lambda selector: {
+            "button.group-list-item:visible": categories,
+            "button.selected-group-button:visible": selected_group,
+        }[selector]
+        crawler = CCCCrawler(page, "user", "password", MagicMock())
+
+        with patch.object(crawler, "wait_for_catalog_element", side_effect=[False, True]):
+            returned_categories, category_names = crawler.load_catalog_categories("OEM1")
+
+        self.assertIs(returned_categories, categories)
+        self.assertEqual(category_names, ["FRONT BUMPER", "FRONT LAMPS"])
+        selected_group.first.click.assert_called_once_with(force=True)
+
+    def test_load_catalog_categories_does_not_treat_page_text_as_controls(self):
+        page = MagicMock()
+        categories = MagicMock()
+        categories.all_inner_texts.return_value = []
+        selected_group = MagicMock()
+        selected_group.count.return_value = 0
+        body = MagicMock()
+        body.inner_text.return_value = "FRONT BUMPER\nFRONT LAMPS\nTIRE"
+        page.locator.side_effect = lambda selector: {
+            "button.group-list-item:visible": categories,
+            "button.selected-group-button:visible": selected_group,
+            "button.selected-group-button": selected_group,
+            "body": body,
+        }[selector]
+        crawler = CCCCrawler(page, "user", "password", MagicMock())
+
+        with patch.object(crawler, "wait_for_catalog_element", return_value=False):
+            with self.assertRaisesRegex(CatalogSearchTimeoutError, "category controls did not load"):
+                crawler.load_catalog_categories("OEM1")
+
+        categories.all_inner_texts.assert_called_once_with()
+        selected_group.first.click.assert_not_called()
+
+    def test_select_catalog_category_reopens_menu_before_clicking_category(self):
+        page = MagicMock()
+        categories = MagicMock()
+        categories.count.side_effect = [2, 2, 2, 2]
+        first_category = MagicMock()
+        first_category.inner_text.return_value = "FRONT BUMPER"
+        subgroup = MagicMock()
+        subgroup.inner_text.return_value = "BUMPER COVER"
+        requested_category = MagicMock()
+        requested_category.inner_text.return_value = "GRILLE"
+        categories.nth.side_effect = [first_category, subgroup, first_category, requested_category]
+        selected_group = MagicMock()
+        selected_group.count.return_value = 1
+        page.locator.side_effect = lambda selector: {
+            "button.group-list-item:visible": categories,
+            "button.selected-group-button:visible": selected_group,
+        }[selector]
+        crawler = CCCCrawler(page, "user", "password", MagicMock())
+
+        with patch.object(crawler, "wait_for_catalog_element", return_value=True) as wait_for:
+            crawler.select_catalog_category("GRILLE", "OEM1")
+
+        selected_group.first.click.assert_called_once_with(force=True)
+        wait_for.assert_called_once_with(categories, "OEM1", "reopening catalog categories")
+        first_category.click.assert_not_called()
+        requested_category.click.assert_called_once_with(force=True)
+
+    def test_select_catalog_category_uses_attached_group_control_when_not_visible(self):
+        page = MagicMock()
+        categories = MagicMock()
+        categories.count.side_effect = [0, 1]
+        requested_category = MagicMock()
+        requested_category.inner_text.return_value = "GRILLE"
+        categories.nth.return_value = requested_category
+        hidden_group = MagicMock()
+        hidden_group.count.return_value = 0
+        attached_group = MagicMock()
+        attached_group.count.return_value = 1
+        page.locator.side_effect = lambda selector: {
+            "button.group-list-item:visible": categories,
+            "button.selected-group-button:visible": hidden_group,
+            "button.selected-group-button": attached_group,
+        }[selector]
+        crawler = CCCCrawler(page, "user", "password", MagicMock())
+
+        with patch.object(crawler, "wait_for_catalog_element", return_value=True):
+            crawler.select_catalog_category("GRILLE", "OEM1")
+
+        attached_group.first.click.assert_called_once_with(force=True)
+        requested_category.click.assert_called_once_with(force=True)
+
+    def test_select_catalog_category_reapplies_oem_filter_when_group_control_is_absent(self):
+        page = MagicMock()
+        categories = MagicMock()
+        categories.count.side_effect = [0, 1]
+        refreshed_category = MagicMock()
+        refreshed_category.inner_text.return_value = "FRONT LAMPS"
+        categories.nth.return_value = refreshed_category
+        no_group = MagicMock()
+        no_group.count.return_value = 0
+        page.locator.side_effect = lambda selector: {
+            "button.group-list-item:visible": categories,
+            "button.selected-group-button:visible": no_group,
+            "button.selected-group-button": no_group,
+        }[selector]
+        crawler = CCCCrawler(page, "user", "password", MagicMock())
+        crawler.apply_oem_catalog_filter = MagicMock()
+
+        with patch.object(crawler, "wait_for_catalog_element", return_value=True):
+            selected = crawler.select_catalog_category("GRILLE", "OEM1")
+
+        crawler.apply_oem_catalog_filter.assert_called_once_with("OEM1", open_estimate=False)
+        self.assertFalse(selected)
+        refreshed_category.click.assert_not_called()
+
+    def test_refreshed_category_queue_skips_categories_already_checked(self):
+        pending = remaining_catalog_categories(
+            ["FRONT BUMPER", "Grille", "Front Lamps"],
+            {"front bumper", "front lamps"},
+        )
+
+        self.assertEqual(list(pending), ["Grille"])
+
+    def test_catalog_scan_deadline_requests_retry(self):
+        with patch("crawler.CATALOG_SCAN_TIMEOUT_SECONDS", 60), patch(
+            "crawler.time.monotonic", return_value=61
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exceeded 60 seconds.*retry required"):
+                CCCCrawler.check_catalog_scan_deadline(0, "OEM1")
+
+    def test_catalog_search_timeout_is_retried_without_stopping_the_row_loop(self):
+        crawler = CCCCrawler(MagicMock(), "user", "password", MagicMock())
+        crawler.open_new_workfile = MagicMock()
+        crawler.enter_vehicle = MagicMock(return_value=True)
+        crawler.open_part_results = MagicMock(
+            side_effect=CatalogSearchTimeoutError("CCC remained busy; retry required")
+        )
+
+        with patch("crawler.MAX_ROW_RETRIES", 1):
+            result = crawler.crawl_row({"VIN": "VIN1", "OEM": "OEM1", "_row": "2"})
+
+        self.assertTrue(str(result["Status"]).startswith("ERROR: catalog search did not complete:"))
+        self.assertIn("retry on resume", result["Status"])
+        self.assertEqual(crawler.open_part_results.call_count, 2)
+        self.assertFalse(crawler._workfile_initialized)
+
+    def test_fatal_row_state_is_recorded_and_retried(self):
+        crawler = CCCCrawler(MagicMock(), "user", "password", MagicMock())
+        crawler.open_new_workfile = MagicMock()
+        crawler.enter_vehicle = MagicMock(return_value=True)
+        crawler.open_part_results = MagicMock(
+            side_effect=FatalCrawlerError("vehicle selection state was unexpected")
+        )
+
+        with patch("crawler.MAX_ROW_RETRIES", 1):
+            result = crawler.crawl_row({"VIN": "VIN1", "OEM": "OEM1", "_row": "2"})
+
+        self.assertTrue(str(result["Status"]).startswith("ERROR: CCC row state could not be recovered:"))
+        self.assertIn("retry on resume", result["Status"])
+        self.assertEqual(crawler.open_part_results.call_count, 2)
+
+    def test_closed_browser_tab_is_replaced_and_session_restored(self):
+        page = MagicMock()
+        page.is_closed.return_value = True
+        context = MagicMock()
+        replacement_page = MagicMock()
+        context.new_page.return_value = replacement_page
+        crawler = CCCCrawler(page, "user", "password", MagicMock(), context=context)
+        crawler.sign_in_if_needed = MagicMock()
+        crawler.open_workfiles = MagicMock()
+
+        crawler.recover_closed_page()
+
+        self.assertIs(crawler.page, replacement_page)
+        replacement_page.route.assert_called_once()
+        crawler.sign_in_if_needed.assert_called_once_with()
+        context.storage_state.assert_called_once()
+        crawler.open_workfiles.assert_called_once_with()
+        self.assertFalse(crawler._workfile_initialized)
 
     def test_non_sourceable_catalog_choice_retries_in_a_fresh_workfile(self):
         page = MagicMock()

@@ -117,6 +117,10 @@ def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip().casefold()
 
 
+def remaining_catalog_categories(category_names: list[str], checked: set[str]) -> deque[str]:
+    return deque(name for name in category_names if normalize(name) not in checked)
+
+
 def description_matches_target(description: str, target: str) -> bool:
     normalized_description = normalize(description)
     normalized_target = normalize(target)
@@ -417,12 +421,59 @@ class CCCCrawler:
                 f"for OEM {oem}; retry required"
             )
 
+    def selected_catalog_group_control(self) -> Locator | None:
+        visible = self.page.locator("button.selected-group-button:visible")
+        if visible.count():
+            return visible.first
+        attached = self.page.locator("button.selected-group-button")
+        return attached.first if attached.count() else None
+
+    def apply_oem_catalog_filter(self, oem: str, open_estimate: bool = True) -> None:
+        self.dismiss_jumpstart_prompt()
+        if open_estimate:
+            self.page.locator('a[aria-label="Estimate"]').click()
+        self.dismiss_jumpstart_prompt()
+        filter_button = self.page.locator("button.filter-button:visible").first
+        filter_button.wait_for(state="visible", timeout=20000)
+        filter_button.click()
+        keyword_box = self.page.locator("input.search-input:visible").last
+        keyword_box.wait_for(state="visible", timeout=10000)
+        keyword_box.fill(oem)
+        self.click_text("ALL MODELS")
+        self.dismiss_jumpstart_prompt()
+        filter_dialog = self.page.locator(".cdk-overlay-pane").filter(
+            has_text=re.compile(r"Filter parts database", re.I)
+        ).last
+        try:
+            filter_dialog.wait_for(state="visible", timeout=5000)
+            ok_button = filter_dialog.locator("button").filter(
+                has_text=re.compile(r"^\s*OK\s*$", re.I)
+            )
+            ok_control = self.first_visible(ok_button)
+            if ok_control is None:
+                ok_control = self.first_visible(
+                    filter_dialog.get_by_text(re.compile(r"^\s*OK\s*$", re.I))
+                )
+            if ok_control is None:
+                raise RuntimeError("Visible exact OK button was not found")
+            ok_control.click(timeout=10000)
+            filter_dialog.wait_for(state="hidden", timeout=10000)
+        except (PlaywrightError, RuntimeError) as error:
+            cancel = self.first_visible(
+                filter_dialog.get_by_text(re.compile(r"^\s*CANCEL\s*$", re.I))
+            )
+            if cancel is None:
+                cancel = self.first_visible(self.page.get_by_text("CANCEL", exact=True))
+            if cancel is not None:
+                cancel.click(timeout=5000)
+            raise RuntimeError(f"CCC OEM filter could not confirm {oem} with its OK button: {error}") from error
+
     def load_catalog_categories(self, oem: str) -> tuple[Locator, list[str]]:
         categories = self.page.locator("button.group-list-item:visible")
         if not self.wait_for_catalog_element(categories, oem, "loading catalog categories"):
-            selected_group = self.page.locator("button.selected-group-button:visible")
-            if selected_group.count():
-                selected_group.first.click(force=True)
+            selected_group = self.selected_catalog_group_control()
+            if selected_group is not None:
+                selected_group.click(force=True)
                 self.wait_for_catalog_element(categories, oem, "opening catalog categories")
 
         category_names = categories.all_inner_texts()
@@ -437,7 +488,7 @@ class CCCCrawler:
             f"CCC catalog category controls did not load for OEM {oem}; retry required"
         )
 
-    def select_catalog_category(self, category_name: str, oem: str) -> None:
+    def select_catalog_category(self, category_name: str, oem: str) -> bool:
         categories = self.page.locator("button.group-list-item:visible")
         matching_category = None
         for index in range(categories.count()):
@@ -447,12 +498,12 @@ class CCCCrawler:
                 break
 
         if matching_category is None:
-            selected_group = self.page.locator("button.selected-group-button:visible")
-            if not selected_group.count():
-                raise CatalogSearchTimeoutError(
-                    f"CCC category menu could not be reopened for OEM {oem}; retry required"
-                )
-            selected_group.first.click(force=True)
+            selected_group = self.selected_catalog_group_control()
+            if selected_group is None:
+                self.checkpoint(f"CCC category control is missing; resetting OEM search for {oem}")
+                self.apply_oem_catalog_filter(oem, open_estimate=False)
+            else:
+                selected_group.click(force=True)
             if not self.wait_for_catalog_element(
                 categories, oem, "reopening catalog categories"
             ):
@@ -466,10 +517,12 @@ class CCCCrawler:
                     break
 
         if matching_category is None:
-            raise CatalogSearchTimeoutError(
-                f"CCC category {category_name.strip()} was not available for OEM {oem}; retry required"
+            self.checkpoint(
+                f"CCC category list changed after reopening for OEM {oem}; refreshing remaining categories"
             )
+            return False
         matching_category.click(force=True)
+        return True
 
     @staticmethod
     def first_visible(locator: Locator) -> Locator | None:
@@ -972,43 +1025,7 @@ class CCCCrawler:
             attempted_catalog_parts = set()
             self.no_sourceable_candidates = False
         self.checkpoint(f"Estimate: searching OEM {oem}")
-        self.dismiss_jumpstart_prompt()
-        self.page.locator('a[aria-label="Estimate"]').click()
-        self.dismiss_jumpstart_prompt()
-        filter_button = self.page.locator("button.filter-button:visible").first
-        filter_button.wait_for(state="visible", timeout=20000)
-        filter_button.click()
-        keyword_box = self.page.locator("input.search-input:visible").last
-        keyword_box.wait_for(state="visible", timeout=10000)
-        keyword_box.fill(oem)
-        self.click_text("ALL MODELS")
-        self.dismiss_jumpstart_prompt()
-        filter_dialog = self.page.locator(".cdk-overlay-pane").filter(
-            has_text=re.compile(r"Filter parts database", re.I)
-        ).last
-        try:
-            filter_dialog.wait_for(state="visible", timeout=5000)
-            ok_button = filter_dialog.locator("button").filter(
-                has_text=re.compile(r"^\s*OK\s*$", re.I)
-            )
-            ok_control = self.first_visible(ok_button)
-            if ok_control is None:
-                ok_control = self.first_visible(
-                    filter_dialog.get_by_text(re.compile(r"^\s*OK\s*$", re.I))
-                )
-            if ok_control is None:
-                raise RuntimeError("Visible exact OK button was not found")
-            ok_control.click(timeout=10000)
-            filter_dialog.wait_for(state="hidden", timeout=10000)
-        except (PlaywrightError, RuntimeError) as error:
-            cancel = self.first_visible(
-                filter_dialog.get_by_text(re.compile(r"^\s*CANCEL\s*$", re.I))
-            )
-            if cancel is None:
-                cancel = self.first_visible(self.page.get_by_text("CANCEL", exact=True))
-            if cancel is not None:
-                cancel.click(timeout=5000)
-            raise RuntimeError(f"CCC OEM filter could not confirm {oem} with its OK button: {error}") from error
+        self.apply_oem_catalog_filter(oem)
         source_tab = self.page.locator("[role=tab].source-parts-tab")
         source_tag = self.page.get_by_role("button", name="Show sourced parts").first
         if (
@@ -1032,10 +1049,23 @@ class CCCCrawler:
         scan_started_at = time.monotonic()
         categories_checked = 0
         subgroups_expanded = 0
-        for category_name in category_names:
+        pending_categories = deque(category_names)
+        checked_categories: set[str] = set()
+        while pending_categories:
             self.check_catalog_scan_deadline(scan_started_at, oem)
+            category_name = pending_categories.popleft()
+            category_key = normalize(category_name)
+            if category_key in checked_categories:
+                continue
             self.checkpoint(f"Checking catalog category {category_name.strip()}")
-            self.select_catalog_category(category_name, oem)
+            category_selected = self.select_catalog_category(category_name, oem)
+            checked_categories.add(category_key)
+            if not category_selected:
+                refreshed_names = categories.all_inner_texts()
+                pending_categories = remaining_catalog_categories(
+                    refreshed_names, checked_categories
+                )
+                continue
             categories_checked += 1
             selected_parts = self.wait_for_catalog_element(
                 parts, oem, f"checking catalog category {category_name.strip()}"
@@ -1688,8 +1718,14 @@ def main() -> int:
                 log.exception("Could not capture failure evidence")
             return 1
         finally:
-            context.close()
-            browser.close()
+            try:
+                context.close()
+            except PlaywrightError as error:
+                log.warning("CCC browser context was already closed during cleanup: %s", error)
+            try:
+                browser.close()
+            except PlaywrightError as error:
+                log.warning("CCC browser was already closed during cleanup: %s", error)
     log.info("Crawl complete: %d/%d rows written to %s", len(results), len(records), args.output)
     return 0
 
