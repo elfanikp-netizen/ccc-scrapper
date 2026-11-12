@@ -1,5 +1,8 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
+from openpyxl import Workbook, load_workbook
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from crawler import (
@@ -9,18 +12,86 @@ from crawler import (
     CatalogSearchTimeoutError,
     MODEL_MISMATCH_RE,
     NO_SOURCE_PARTS_RE,
+    OUTPUT_COLUMNS,
     PartOffer,
     catalog_not_found_error,
+    choose_vin_vehicle_option,
     expand_group_result,
     is_no_catalog_results,
+    load_results,
     remaining_catalog_categories,
     prepare_result_slots,
     resume_state,
+    read_input,
+    scenario_path_parts,
+    save_results,
     should_retry_row_status,
+    vin_model_year_matches,
+    validate_selected_vehicle_year,
 )
 
 
 class NoCatalogResultsDetectionTests(unittest.TestCase):
+    def test_result_columns_put_partslink_before_oem_without_og_oem(self):
+        self.assertIn("Partslink", OUTPUT_COLUMNS)
+        self.assertIn("OEM", OUTPUT_COLUMNS)
+        self.assertIn("Part Description", OUTPUT_COLUMNS)
+        self.assertNotIn("OG OEM", OUTPUT_COLUMNS)
+
+        with TemporaryDirectory() as directory:
+            output_path = Path(directory) / "scenario-output.xlsx"
+            save_results(output_path, [{"VIN": "VIN123", "Partslink": "MI3030181", "OEM": "92110W040P"}])
+            workbook = load_workbook(output_path, read_only=True, data_only=True)
+            headers = next(workbook.active.iter_rows(values_only=True))
+            workbook.close()
+
+        self.assertIn("Partslink", headers)
+        self.assertIn("OEM", headers)
+        self.assertNotIn("OG OEM", headers)
+
+    def test_resume_converts_legacy_og_oem_output_columns(self):
+        with TemporaryDirectory() as directory:
+            output_path = Path(directory) / "legacy-output.xlsx"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.append(["VIN", "OEM", "OG OEM", "Status"])
+            worksheet.append(["VIN123", "MI3030181", "92110W040P", "OK"])
+            workbook.save(output_path)
+            workbook.close()
+
+            results = load_results(output_path)
+
+        self.assertEqual(results[0]["Partslink"], "MI3030181")
+        self.assertEqual(results[0]["OEM"], "92110W040P")
+        self.assertNotIn("OG OEM", results[0])
+
+    def test_scenario_path_splits_nonempty_catalog_levels(self):
+        self.assertEqual(
+            scenario_path_parts(" AIR CONDITIONER & HEATER > CONDENSER, COMPRESSOR & LINES > CONDENSER "),
+            ["AIR CONDITIONER & HEATER", "CONDENSER, COMPRESSOR & LINES", "CONDENSER"],
+        )
+
+    def test_scenario_input_reads_enriched_workbook_and_keeps_partslink_separate(self):
+        with TemporaryDirectory() as directory:
+            input_path = Path(directory) / "scenario-input.xlsx"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.append(["VIN", "PARTSLINK", "Scenario"])
+            worksheet.append([
+                "VIN123",
+                "MI3030181",
+                "AIR CONDITIONER & HEATER > CONDENSER, COMPRESSOR & LINES > CONDENSER",
+            ])
+            workbook.save(input_path)
+            workbook.close()
+
+            records = read_input(input_path, "vin_partslink_scenario")
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["PARTSLINK"], "MI3030181")
+        self.assertNotIn("OEM", records[0])
+        self.assertTrue(records[0]["Scenario"].endswith("> CONDENSER"))
+
     def test_identical_vin_oem_rows_share_pending_lookup_and_keep_output_rows(self):
         records = [
             {"VIN": "VIN1", "OEM": "OEM1", "_row": "2"},
@@ -49,6 +120,30 @@ class NoCatalogResultsDetectionTests(unittest.TestCase):
     def test_detects_no_results_message(self):
         body = "No results found for search text: 312768310"
         self.assertTrue(is_no_catalog_results(body))
+
+    def test_vin_model_year_code_selects_matching_ccc_option(self):
+        vin = "2G1FB1E39D9148021"
+
+        self.assertTrue(vin_model_year_matches(vin, 2013))
+        self.assertFalse(vin_model_year_matches(vin, 2011))
+        self.assertEqual(
+            choose_vin_vehicle_option(vin, [
+                "2011 Chevrolet Equinox LT2 FWD",
+                "2013 Chevrolet Camaro LT1",
+            ]),
+            1,
+        )
+
+    def test_vehicle_option_falls_back_when_ccc_options_have_no_year(self):
+        self.assertEqual(
+            choose_vin_vehicle_option("2G1FB1E39D9148021", ["Camaro LT1", "Camaro SS"]),
+            0,
+        )
+
+    def test_incompatible_ccc_vehicle_year_is_retryable_state_error(self):
+        with self.assertRaisesRegex(FatalCrawlerError, "model year 2011.*conflicts with VIN"):
+            validate_selected_vehicle_year("2G1FB1E39D9148021", "2011")
+        validate_selected_vehicle_year("2G1FB1E39D9148021", "2013")
 
     def test_rejects_valid_catalog_pages(self):
         body = "A/C Compressor 1234 part list"
@@ -83,7 +178,7 @@ class NoCatalogResultsDetectionTests(unittest.TestCase):
             )
         )
 
-    def test_resume_retries_failures_and_qualified_capa_market_rows(self):
+    def test_resume_retries_failures_and_excludes_nonexact_capa_market_rows(self):
         results = [
             {"VIN": "VIN1", "OEM": "OEM1", "Status": "No catalog results found for OEM OEM1; skipped"},
             {"VIN": "VIN2", "OEM": "OEM2", "Status": "ERROR: catalog did not load"},
@@ -110,15 +205,16 @@ class NoCatalogResultsDetectionTests(unittest.TestCase):
         self.assertEqual(list(retry_rows[("VIN2", "OEM2")]), [1])
         self.assertEqual(list(retry_rows[("VIN3", "OEM3")]), [2])
         self.assertEqual(completed[("VIN4", "OEM4")], 1)
-        self.assertEqual(list(retry_rows[("VIN5", "OEM5")]), [4])
+        self.assertEqual(completed[("VIN5", "OEM5")], 1)
+        self.assertNotIn(("VIN5", "OEM5"), retry_rows)
         self.assertEqual(completed[("VIN6", "OEM6")], 1)
 
-    def test_qualified_capa_description_is_included_in_summary(self):
+    def test_exact_capa_description_is_included_in_summary(self):
         result = CCCCrawler.summarize(
             "VIN1",
             "OEM1",
             [
-                PartOffer("iPart Automotive Inc.", "A/M: DS, CAPA", 267.0),
+                PartOffer("iPart Automotive Inc.", "A/M: CAPA", 267.0),
                 PartOffer("Other supplier", "A/M", 100.0),
             ],
         )
@@ -127,6 +223,56 @@ class NoCatalogResultsDetectionTests(unittest.TestCase):
         self.assertTrue(result["Ipart listed on CCC"])
         self.assertEqual(result["Ipart List Price CCC"], 267.0)
         self.assertEqual(result["Lowest CCC Price"], 267.0)
+
+    def test_summary_writes_selected_estimate_part_number_as_oem(self):
+        result = CCCCrawler.summarize(
+            "VIN1",
+            "92110W040P",
+            [PartOffer("iPart Automotive Inc.", "A/M: CAPA", 267.0)],
+            partslink="MI3030181",
+            part_description="Condenser",
+        )
+
+        self.assertEqual(result["OEM"], "92110W040P")
+        self.assertEqual(result["Partslink"], "MI3030181")
+        self.assertEqual(result["Part Description"], "Condenser")
+        self.assertNotIn("OG OEM", result)
+
+    def test_edit_properties_waits_for_part_number_and_description_before_reading(self):
+        page = MagicMock()
+        edit_button = MagicMock()
+        edit_button.is_visible.return_value = True
+        edit_buttons = MagicMock()
+        edit_buttons.count.return_value = 1
+        edit_buttons.nth.return_value = edit_button
+        close_buttons = MagicMock()
+        close_buttons.count.return_value = 0
+        page.get_by_role.side_effect = [edit_buttons, close_buttons]
+
+        part_number_label = MagicMock()
+        description_label = MagicMock()
+        part_number_label.last = part_number_label
+        description_label.last = description_label
+        page.get_by_text.side_effect = [part_number_label, description_label]
+        overlay_dialog = MagicMock()
+        overlay_dialog.count.return_value = 1
+        overlay_locator = MagicMock()
+        overlay_locator.filter.return_value.last = overlay_dialog
+        page.locator.return_value = overlay_locator
+
+        events = []
+        part_number_label.wait_for.side_effect = lambda **_: events.append("part-number-ready")
+        description_label.wait_for.side_effect = lambda **_: events.append("description-ready")
+        page.evaluate.side_effect = lambda _: events.append("read-values") or {
+            "partNumber": "92110W040P",
+            "description": "Condenser",
+        }
+        crawler = CCCCrawler(page, "user", "password", Path("."))
+
+        values = crawler.read_selected_part_properties("Condenser")
+
+        self.assertEqual(values, ("92110W040P", "Condenser"))
+        self.assertEqual(events, ["part-number-ready", "description-ready", "read-values"])
 
     def test_generic_aftermarket_is_not_capa(self):
         result = CCCCrawler.summarize(
