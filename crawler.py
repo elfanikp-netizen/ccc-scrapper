@@ -69,6 +69,7 @@ VEHICLE_TITLE_RE = re.compile(
     re.I,
 )
 MULTIWORD_MAKES = ("Alfa Romeo", "Aston Martin", "Land Rover", "Rolls Royce")
+VIN_MODEL_YEAR_CODES = "ABCDEFGHJKLMNPRSTVWXY123456789"
 MARKET_DATA_FIELDS = {
     "description": "description",
     "vendor": "vendor",
@@ -117,18 +118,38 @@ def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip().casefold()
 
 
+def vin_model_year_matches(vin: str, year: str | int) -> bool:
+    rendered_vin = (vin or "").strip().upper()
+    try:
+        model_year = int(year)
+    except (TypeError, ValueError):
+        return False
+    if len(rendered_vin) < 10 or not 1980 <= model_year <= 2100:
+        return False
+    return rendered_vin[9] == VIN_MODEL_YEAR_CODES[(model_year - 1980) % len(VIN_MODEL_YEAR_CODES)]
+
+
+def validate_selected_vehicle_year(vin: str, year: str) -> None:
+    if year and not vin_model_year_matches(vin, year):
+        raise FatalCrawlerError(
+            f"CCC selected model year {year}, which conflicts with VIN {vin}'s model-year code; retry required"
+        )
+
+
+def choose_vin_vehicle_option(vin: str, option_texts: list[str]) -> int:
+    for index, option_text in enumerate(option_texts):
+        years = re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", option_text)
+        if any(vin_model_year_matches(vin, year) for year in years):
+            return index
+    return 0
+
+
 def remaining_catalog_categories(category_names: list[str], checked: set[str]) -> deque[str]:
     return deque(name for name in category_names if normalize(name) not in checked)
 
 
 def description_matches_target(description: str, target: str) -> bool:
-    normalized_description = normalize(description)
-    normalized_target = normalize(target)
-    if normalized_target in normalized_description:
-        return True
-    target_tokens = set(re.findall(r"[a-z0-9]+", normalized_target))
-    description_tokens = set(re.findall(r"[a-z0-9]+", normalized_description))
-    return bool(target_tokens) and target_tokens.issubset(description_tokens)
+    return normalize(description) == normalize(target)
 
 
 def market_data_matches_target(market_data: Any, target: str) -> bool:
@@ -832,7 +853,13 @@ class CCCCrawler:
             return False
         while selection_state == "options":
             options = self.page.locator('[role="option"]:visible')
-            options.first.click()
+            option_texts = [options.nth(index).inner_text().strip() for index in range(options.count())]
+            selected_option = choose_vin_vehicle_option(vin, option_texts)
+            self.checkpoint(
+                f"Selecting CCC vehicle option {selected_option + 1}/{len(option_texts)} "
+                f"for VIN {vin}: {option_texts[selected_option]}"
+            )
+            options.nth(selected_option).click()
             self.checkpoint("CCC vehicle model selected; advancing to Finish")
             self.click_text("Next")
             selection_state = self.resolve_vehicle_change_state(self.page.url)
@@ -844,6 +871,8 @@ class CCCCrawler:
         self.checkpoint("CCC vehicle selection complete; clicking DONE")
         self.finish_vehicle_selection()
         self._vehicle_details = extract_vehicle_details(self.page.locator("body").inner_text())
+        selected_year = self._vehicle_details["Year"]
+        validate_selected_vehicle_year(vin, selected_year)
         if self._vehicle_details["Year"]:
             log.info(
                 "Selected vehicle: Year=%s Make=%s Model=%s",
