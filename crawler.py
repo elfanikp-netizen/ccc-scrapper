@@ -45,7 +45,7 @@ OUTPUT_COLUMNS = [
 ]
 PART_TYPE_OUTPUT_COLUMNS = OUTPUT_COLUMNS + [
     "Part Type Code", "Part Type Description", "Input Part Type Description",
-    "Scenario", "Scenario Categories",
+    "Scenario", "Scenario Categories", "Catalog Part", "Category Parts",
 ]
 IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
@@ -163,6 +163,29 @@ def matching_part_type_categories(search: str, categories: list[str]) -> list[st
     matches = [category for category in categories if wanted and wanted in normalize(category)]
     built_matches = [category for category in matches if re.search(r"\b(?:US|JAPAN)\s+BUILT\b", category, re.I)]
     return built_matches if built_matches else matches[:1]
+
+
+def matching_catalog_parts(descriptions: list[str]) -> list[str]:
+    if not descriptions:
+        return []
+    first = descriptions[0]
+    side_pattern = re.compile(r"\b(right|left|rt|lt)\b", re.I)
+    side = side_pattern.search(first)
+    if not side:
+        return [first]
+    opposite = {"right": {"left", "lt"}, "rt": {"left", "lt"},
+                "left": {"right", "rt"}, "lt": {"right", "rt"}}[side.group().casefold()]
+    key = normalize(side_pattern.sub("<side>", first, count=1))
+    for candidate in descriptions[1:]:
+        candidate_side = side_pattern.search(candidate)
+        if candidate_side and candidate_side.group().casefold() in opposite and normalize(side_pattern.sub("<side>", candidate, count=1)) == key:
+            return [first, candidate]
+    return [first]
+
+
+def catalog_part_description(row_text: str) -> str:
+    lines = [line.strip() for line in row_text.splitlines() if line.strip()]
+    return next((line for line in lines if not re.fullmatch(r"[\d.,$]+", line)), "")
 
 
 def description_matches_target(description: str, target: str) -> bool:
@@ -669,7 +692,8 @@ class CCCCrawler:
                 has_text=re.compile(r"^\s*replace\s+" + description_pattern, re.I)
             ).last
             estimate_line.wait_for(state="visible", timeout=15000)
-            estimate_line.click(timeout=10000)
+            estimate_row = estimate_line.locator("xpath=ancestor::app-estimate-row[1]")
+            estimate_row.locator(".line-item-display-row .column-part-number").first.click(timeout=10000)
         edit_properties = self.first_visible(
             self.page.get_by_role("button", name=re.compile(r"edit properties", re.I))
         )
@@ -870,7 +894,7 @@ class CCCCrawler:
         self.page.locator('a[aria-label="Estimate"]').click()
         self.dismiss_jumpstart_prompt()
 
-    def open_part_type_scenario_results(self, scenario: str, category: str) -> tuple[int | None, str, str]:
+    def open_part_type_catalog_parts(self, scenario: str, category: str) -> Locator:
         self.open_part_type_catalog(scenario)
         self.load_catalog_categories(scenario, lookup_label="scenario")
         if re.search(r"\b(?:US|JAPAN)\s+BUILT\b", category, re.I):
@@ -892,9 +916,28 @@ class CCCCrawler:
                 raise CatalogSearchTimeoutError(f"CCC showed no part rows in '{category}'; retry required")
             collapsed[0].click()
             found = self.wait_for_catalog_element(parts, scenario, f"expanding {category}")
+        return parts
+
+    def discover_part_type_parts(self, scenario: str, category: str) -> list[str]:
+        parts = self.open_part_type_catalog_parts(scenario, category)
+        descriptions = [catalog_part_description(text) for text in parts.all_inner_texts()]
+        if not descriptions or not descriptions[0]:
+            raise CatalogSearchTimeoutError(f"CCC showed no readable part in '{category}'; retry required")
+        return matching_catalog_parts(descriptions)
+
+    def open_part_type_scenario_results(self, scenario: str, category: str, catalog_part: str = "") -> tuple[int | None, str, str]:
+        parts = self.open_part_type_catalog_parts(scenario, category)
         candidate = parts.first
-        selected_lines = [line.strip() for line in candidate.inner_text().splitlines() if line.strip()]
-        selected_text = next((line for line in selected_lines if not re.fullmatch(r"[\d.,$]+", line)), "")
+        if catalog_part:
+            candidate = None
+            for index in range(parts.count()):
+                part = parts.nth(index)
+                if normalize(catalog_part_description(part.inner_text())) == normalize(catalog_part):
+                    candidate = part
+                    break
+            if candidate is None:
+                raise CatalogSearchTimeoutError(f"CCC catalog part '{catalog_part}' is no longer available; retry required")
+        selected_text = catalog_part_description(candidate.inner_text())
         if not selected_text:
             raise RuntimeError("Selected catalog part has no readable description")
         candidate.dblclick(timeout=15000)
@@ -1949,7 +1992,7 @@ class CCCCrawler:
                     nonlocal selected_oem, part_description
                     if part_type_mode:
                         retry_count_value, selected_oem, part_description = self.open_part_type_scenario_results(
-                            record["Scenario"], record["_category"]
+                            record["Scenario"], record["_category"], record.get("_catalog_part", "")
                         )
                         return retry_count_value
                     if scenario_mode:
@@ -2136,9 +2179,6 @@ def run_part_type_groups(
                     break
             except (TypeError, ValueError):
                 continue
-        by_category = {normalize(str(row.get("Part Type Description") or "")): row for row in previous
-                       if part_type_result_complete(row, target)}
-
         def checkpoint(rows: list[dict[str, Any]]) -> None:
             nonlocal results
             results = [row for row in results if part_type_key(row, saved=True) != key]
@@ -2168,17 +2208,45 @@ def run_part_type_groups(
                                   "date_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, "", [])])
             continue
 
-        previous_by_category = {normalize(str(row.get("Part Type Description") or "")): row for row in previous}
-        rows = [previous_by_category[normalize(category)] for category in categories
-                if normalize(category) in previous_by_category]
+        rows_by_part: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in previous:
+            row_key = (normalize(str(row.get("Part Type Description") or "")), normalize(str(row.get("Catalog Part") or "")))
+            if row_key not in rows_by_part or part_type_result_complete(row, target):
+                rows_by_part[row_key] = row
+        rows = list(rows_by_part.values())
         for category in categories:
-            if normalize(category) in by_category:
-                continue
-            result = crawler.crawl_row({**record, "_category": category})
-            rows = [row for row in rows if normalize(str(row.get("Part Type Description") or "")) != normalize(category)]
-            rows.append(decorate(result, category, categories))
-            checkpoint(rows)
-        if rows and len(rows) == len(categories):
+            category_rows = [row for row in rows if normalize(str(row.get("Part Type Description") or "")) == normalize(category)]
+            parts = None
+            for row in category_rows:
+                try:
+                    saved_parts = json.loads(str(row.get("Category Parts") or ""))
+                    if isinstance(saved_parts, list) and saved_parts and all(isinstance(part, str) and part for part in saved_parts):
+                        parts = saved_parts
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if parts is None:
+                try:
+                    crawler.ensure_part_type_vehicle(record["VIN"])
+                    parts = crawler.discover_part_type_parts(record["Scenario"], category)
+                except Exception as error:
+                    log.exception("Could not discover parts for VIN=%s category=%s", record["VIN"], category)
+                    rows = [row for row in rows if not (normalize(str(row.get("Part Type Description") or "")) == normalize(category) and not row.get("Catalog Part"))]
+                    rows.append(decorate({"Status": f"ERROR: part discovery failed: {error}",
+                                          "date_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, category, categories))
+                    checkpoint(rows)
+                    continue
+            for part in parts:
+                matching_rows = [row for row in category_rows if normalize(str(row.get("Catalog Part") or "")) == normalize(part)]
+                if any(part_type_result_complete(row, target) for row in matching_rows):
+                    continue
+                result = crawler.crawl_row({**record, "_category": category, "_catalog_part": part})
+                rows = [row for row in rows if not (normalize(str(row.get("Part Type Description") or "")) == normalize(category)
+                        and (normalize(str(row.get("Catalog Part") or "")) == normalize(part) or not row.get("Catalog Part")))]
+                result.update({"Catalog Part": part, "Category Parts": json.dumps(parts)})
+                rows.append(decorate(result, category, categories))
+                checkpoint(rows)
+        if rows:
             checkpoint(rows)
     return results
 
@@ -2234,7 +2302,7 @@ def main() -> int:
                 headers = list(next(workbook.active.iter_rows(values_only=True), ()))
                 sheet_names = workbook.sheetnames
                 workbook.close()
-                if headers != PART_TYPE_OUTPUT_COLUMNS or sheet_names != ["CCC Results"]:
+                if headers not in (PART_TYPE_OUTPUT_COLUMNS, PART_TYPE_OUTPUT_COLUMNS[:-2]) or sheet_names != ["CCC Results"]:
                     raise ValueError("output columns do not match this crawler's result schema")
             except Exception as error:
                 log.error("Cannot safely resume output workbook: %s", error)

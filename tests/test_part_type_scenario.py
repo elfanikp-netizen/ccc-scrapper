@@ -9,7 +9,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from crawler import (
     CCCCrawler, PART_TYPE_OUTPUT_COLUMNS, load_results, main,
-    matching_part_type_categories, part_type_result_complete, read_input, run_part_type_groups, save_results,
+    matching_catalog_parts, matching_part_type_categories, part_type_result_complete, read_input, run_part_type_groups, save_results,
 )
 
 
@@ -54,6 +54,31 @@ class PartTypeScenarioTests(unittest.TestCase):
                          ["Front Bumper"])
         self.assertEqual(matching_part_type_categories("", ["Front Bumper"]), [])
 
+    def test_selects_only_matching_opposite_side(self):
+        self.assertEqual(matching_catalog_parts(["Right Fender", "Left Fender liner", "Left Fender"]),
+                         ["Right Fender", "Left Fender"])
+        self.assertEqual(matching_catalog_parts(["LT Fender", "RT Fender"]), ["LT Fender", "RT Fender"])
+        self.assertEqual(matching_catalog_parts(["Bumper cover", "Right Fender", "Left Fender"]), ["Bumper cover"])
+        self.assertEqual(matching_catalog_parts(["Right Fender", "Left Fender liner"]), ["Right Fender"])
+
+    def test_resume_processes_only_missing_side(self):
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "results.xlsx"
+            crawler = MagicMock()
+            crawler.discover_part_type_categories.return_value = ["FENDER"]
+            crawler.discover_part_type_parts.return_value = ["Right Fender", "Left Fender"]
+            crawler.crawl_row.side_effect = [{"OEM": "RIGHT", "Status": "OK"}, KeyboardInterrupt()]
+            with self.assertRaises(KeyboardInterrupt):
+                run_part_type_groups(crawler, [self.record], [], output, "A/M: CAPA")
+            saved = load_results(output, preserve_all=True)
+            self.assertEqual([row["Catalog Part"] for row in saved], ["Right Fender"])
+            crawler.reset_mock()
+            crawler.crawl_row.side_effect = [{"OEM": "LEFT", "Status": "OK"}]
+            results = run_part_type_groups(crawler, [self.record], saved, output, "A/M: CAPA")
+            self.assertEqual([row["OEM"] for row in results], ["RIGHT", "LEFT"])
+            self.assertEqual(crawler.crawl_row.call_args.args[0]["_catalog_part"], "Left Fender")
+            crawler.discover_part_type_parts.assert_not_called()
+
     def test_part_type_catalog_opens_estimate_without_keyword_search(self):
         page = MagicMock()
         crawler = CCCCrawler(page, "user", "password", Path("."))
@@ -89,6 +114,7 @@ class PartTypeScenarioTests(unittest.TestCase):
     def test_missing_scenario_is_skipped_before_next_scenario(self):
         with TemporaryDirectory() as directory:
             crawler = MagicMock()
+            crawler.discover_part_type_parts.return_value = ["Part"]
             crawler.discover_part_type_categories.side_effect = [[], ["FENDER US BUILT"]]
             crawler.crawl_row.return_value = {"OEM": "OEM-1", "Status": "OK"}
             missing = {**self.record, "Scenario": "NOT FOUND"}
@@ -100,6 +126,7 @@ class PartTypeScenarioTests(unittest.TestCase):
     def test_scenarios_are_processed_by_vin_before_next_vehicle(self):
         with TemporaryDirectory() as directory:
             crawler = MagicMock()
+            crawler.discover_part_type_parts.return_value = ["Part"]
             crawler.discover_part_type_categories.side_effect = lambda record: [record["Scenario"]]
             crawler.crawl_row.return_value = {"Status": "OK"}
             records = [self.record, {**self.record, "VIN": "VIN2", "Scenario": "FENDER"},
@@ -144,6 +171,21 @@ class PartTypeScenarioTests(unittest.TestCase):
         crawler.read_selected_part_properties.assert_called_once_with("Bumper cover", select_added_line=True)
         page.locator.assert_any_call("app-estimate-row")
 
+    def test_select_estimate_row_by_number_not_multiple_parts_button(self):
+        page = MagicMock()
+        description = page.locator.return_value.filter.return_value.last
+        row = description.locator.return_value
+        number = row.locator.return_value.first
+        page.evaluate.return_value = {"partNumber": "04711TVAA00ZZ", "description": "Bumper cover w/o prk aid"}
+        crawler = CCCCrawler(page, "user", "password", Path("."))
+        crawler.first_visible = MagicMock(return_value=MagicMock())
+        self.assertEqual(crawler.read_selected_part_properties("Bumper cover w/o prk aid", select_added_line=True),
+                         ("04711TVAA00ZZ", "Bumper cover w/o prk aid"))
+        description.click.assert_not_called()
+        description.locator.assert_called_once_with("xpath=ancestor::app-estimate-row[1]")
+        row.locator.assert_called_once_with(".line-item-display-row .column-part-number")
+        number.click.assert_called_once_with(timeout=10000)
+
     def test_existing_estimate_line_without_source_button_is_not_market_listed(self):
         page = MagicMock()
         parts = MagicMock()
@@ -174,13 +216,14 @@ class PartTypeScenarioTests(unittest.TestCase):
         crawler.open_part_type_scenario_results = MagicMock(return_value=(0, "OEM1", "Bumper cover"))
         crawler.read_vendor_inventory = MagicMock(return_value=([], []))
         result = crawler.crawl_row({**self.record, "_category": "Front Bumper US Built"})
-        crawler.open_part_type_scenario_results.assert_called_once_with("front bumper", "Front Bumper US Built")
+        crawler.open_part_type_scenario_results.assert_called_once_with("front bumper", "Front Bumper US Built", "")
         self.assertEqual((result["OEM"], result["Part Description"]), ("OEM1", "Bumper cover"))
 
     def test_resume_after_interruption_keeps_each_category_and_duplicates(self):
         with TemporaryDirectory() as directory:
             output = Path(directory) / "results.xlsx"
             crawler = MagicMock()
+            crawler.discover_part_type_parts.return_value = ["Part"]
             categories = ["Front Bumper US Built", "Front Bumper Japan Built"]
             crawler.discover_part_type_categories.return_value = categories
             crawler.crawl_row.side_effect = [{"OEM": "US-OEM", "Status": "OK"}, KeyboardInterrupt()]
@@ -211,6 +254,7 @@ class PartTypeScenarioTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             output = Path(directory) / "results.xlsx"
             crawler = MagicMock()
+            crawler.discover_part_type_parts.return_value = ["Part"]
             crawler.discover_part_type_categories.return_value = ["Front Bumper US Built", "Front Bumper Japan Built"]
             crawler.crawl_row.side_effect = [{"OEM": "A", "Status": "OK"}, {"Status": "ERROR: failed"}]
             first = run_part_type_groups(crawler, [self.record], [], output, "A/M: CAPA")
@@ -225,6 +269,7 @@ class PartTypeScenarioTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             output = Path(directory) / "results.xlsx"
             crawler = MagicMock()
+            crawler.discover_part_type_parts.return_value = ["Part"]
             crawler.discover_part_type_categories.return_value = ["Front Bumper US Built", "Front Bumper Japan Built"]
             crawler.crawl_row.side_effect = [{"Status": "ERROR: first"}, {"Status": "ERROR: second"}]
             first = run_part_type_groups(crawler, [self.record], [], output, "A/M: CAPA")
