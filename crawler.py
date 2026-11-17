@@ -43,6 +43,10 @@ OUTPUT_COLUMNS = [
     "market_data",
     "Description Target",
 ]
+PART_TYPE_OUTPUT_COLUMNS = OUTPUT_COLUMNS + [
+    "Part Type Code", "Part Type Description", "Input Part Type Description",
+    "Scenario", "Scenario Categories",
+]
 IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
 MAX_VENDOR_SEARCH_RETRIES = 3
@@ -154,6 +158,13 @@ def scenario_path_parts(scenario: str) -> list[str]:
     return [part.strip() for part in scenario.split(">") if part.strip()]
 
 
+def matching_part_type_categories(search: str, categories: list[str]) -> list[str]:
+    wanted = normalize(search)
+    matches = [category for category in categories if wanted and wanted in normalize(category)]
+    built_matches = [category for category in matches if re.search(r"\b(?:US|JAPAN)\s+BUILT\b", category, re.I)]
+    return built_matches if built_matches else matches[:1]
+
+
 def description_matches_target(description: str, target: str) -> bool:
     return normalize(description) == normalize(target)
 
@@ -192,6 +203,11 @@ def catalog_not_found_error(
 ) -> CatalogPartNotFoundError | None:
     if not is_no_catalog_results(body_text):
         return None
+    quoted_search = re.search(r"no results found for search text:\s*['\"]([^'\"]+)['\"]", body_text, re.I)
+    unquoted_search = re.search(r"no results found for search text:\s*([^\r\n;]+)", body_text, re.I)
+    for match in (quoted_search, unquoted_search):
+        if match and normalize(match.group(1).rstrip(".,:)!? ")) == normalize(oem):
+            return CatalogPartNotFoundError(f"No catalog results found for OEM {oem}")
     result = re.search(
         r"no results found for search text:\s*[\"']?([^\s\"';]+)",
         normalize(body_text),
@@ -231,6 +247,22 @@ def read_input(path: Path, search_action: str = "vin_oem") -> list[dict[str, str
     sheet = workbook.active
     rows = sheet.iter_rows(values_only=True)
     headers = [normalize(str(value or "")) for value in next(rows, ())]
+    if search_action == "vin_part_type_scenario":
+        fields = ("VIN", "Part Type Code", "Part Type Description", "Scenario")
+        try:
+            indexes = [headers.index(normalize(field)) for field in fields]
+        except ValueError as error:
+            workbook.close()
+            raise ValueError("Part type scenario input workbook must have VIN, Part Type Code, Part Type Description, and Scenario columns.") from error
+        records = []
+        for row_number, row in enumerate(rows, start=2):
+            values = [str(row[index] or "").strip() if index < len(row) else "" for index in indexes]
+            if all(values):
+                records.append({**dict(zip(fields, values)), "_row": str(row_number)})
+            elif any(values):
+                log.warning("Skipping input row %d: a part type scenario field is blank", row_number)
+        workbook.close()
+        return records
     if search_action == "vin_partslink_scenario":
         try:
             vin_index = headers.index("vin")
@@ -277,14 +309,14 @@ def read_input(path: Path, search_action: str = "vin_oem") -> list[dict[str, str
     return records
 
 
-def save_results(path: Path, results: list[dict[str, Any]]) -> None:
+def save_results(path: Path, results: list[dict[str, Any]], columns: list[str] = OUTPUT_COLUMNS) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "CCC Results"
-    sheet.append(OUTPUT_COLUMNS)
+    sheet.append(columns)
     for result in results:
-        sheet.append([result.get(column) for column in OUTPUT_COLUMNS])
+        sheet.append([result.get(column) for column in columns])
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
     temporary_path: Path | None = None
@@ -306,7 +338,7 @@ def save_results(path: Path, results: list[dict[str, Any]]) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def load_results(path: Path) -> list[dict[str, Any]]:
+def load_results(path: Path, preserve_all: bool = False) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     workbook = load_workbook(path, read_only=True, data_only=True)
@@ -323,13 +355,15 @@ def load_results(path: Path) -> list[dict[str, Any]]:
             result = {
                 column: row[index] if index < len(row) else None
                 for column, index in header_indexes.items()
-                if column in OUTPUT_COLUMNS or column == "OG OEM"
+                if column in PART_TYPE_OUTPUT_COLUMNS or column == "OG OEM"
             }
             if result.get("OG OEM"):
                 result["Partslink"] = result.get("Partslink") or result.get("OEM")
                 result["OEM"] = result["OG OEM"]
             result.pop("OG OEM", None)
-            if result.get("VIN") and (result.get("Partslink") or result.get("OEM")):
+            if (preserve_all and any(value is not None for value in row)) or (
+                result.get("VIN") and (result.get("Partslink") or result.get("OEM"))
+            ):
                 results.append(result)
         return results
     finally:
@@ -443,6 +477,8 @@ class CCCCrawler:
         self.description_target = description_target
         self.workfiles_url: str | None = None
         self._workfile_initialized = False
+        self._part_type_vin: str | None = None
+        self._part_type_all_models = False
         self._vehicle_details: dict[str, str] = {"Year": "", "Make": "", "Model": ""}
         self.no_sourceable_candidates = False
         self.artifacts.mkdir(parents=True, exist_ok=True)
@@ -455,7 +491,7 @@ class CCCCrawler:
             locator.first.wait_for(state="visible", timeout=CATALOG_QUICK_WAIT_MS)
             return True
         except PlaywrightTimeoutError:
-            body_text = normalize(self.page.locator("body").inner_text())
+            body_text = self.page.locator("body").inner_text()
             not_found_error = catalog_not_found_error(body_text, oem)
             if not_found_error is not None:
                 raise not_found_error
@@ -469,7 +505,7 @@ class CCCCrawler:
                 locator.first.wait_for(state="visible", timeout=CATALOG_LOADING_WAIT_MS)
                 return True
             except PlaywrightTimeoutError as error:
-                body_text = normalize(self.page.locator("body").inner_text())
+                body_text = self.page.locator("body").inner_text()
                 not_found_error = catalog_not_found_error(body_text, oem)
                 if not_found_error is not None:
                     raise not_found_error from error
@@ -493,7 +529,7 @@ class CCCCrawler:
         attached = self.page.locator("button.selected-group-button")
         return attached.first if attached.count() else None
 
-    def apply_oem_catalog_filter(self, oem: str, open_estimate: bool = True) -> None:
+    def apply_oem_catalog_filter(self, oem: str, open_estimate: bool = True, model_scope: str = "ALL MODELS") -> None:
         self.dismiss_jumpstart_prompt()
         if open_estimate:
             self.page.locator('a[aria-label="Estimate"]').click()
@@ -504,7 +540,7 @@ class CCCCrawler:
         keyword_box = self.page.locator("input.search-input:visible").last
         keyword_box.wait_for(state="visible", timeout=10000)
         keyword_box.fill(oem)
-        self.click_text("ALL MODELS")
+        self.page.get_by_text(model_scope, exact=True).last.click(timeout=10000)
         self.dismiss_jumpstart_prompt()
         filter_dialog = self.page.locator(".cdk-overlay-pane").filter(
             has_text=re.compile(r"Filter parts database", re.I)
@@ -533,24 +569,44 @@ class CCCCrawler:
                 cancel.click(timeout=5000)
             raise RuntimeError(f"CCC OEM filter could not confirm {oem} with its OK button: {error}") from error
 
-    def load_catalog_categories(self, oem: str) -> tuple[Locator, list[str]]:
+    def load_catalog_categories(self, oem: str, lookup_label: str = "OEM") -> tuple[Locator, list[str]]:
         categories = self.page.locator("button.group-list-item:visible")
         if not self.wait_for_catalog_element(categories, oem, "loading catalog categories"):
             selected_group = self.selected_catalog_group_control()
             if selected_group is not None:
                 selected_group.click(force=True)
                 self.wait_for_catalog_element(categories, oem, "opening catalog categories")
+            else:
+                try:
+                    categories.first.wait_for(state="visible", timeout=CATALOG_LOADING_WAIT_MS)
+                except PlaywrightTimeoutError:
+                    pass
 
         category_names = categories.all_inner_texts()
         if category_names:
             return categories, category_names
 
-        body_text = normalize(self.page.locator("body").inner_text())
+        if lookup_label == "scenario":
+            self.checkpoint(f"Reopening the current estimate to recover catalog categories for scenario {oem}")
+            self.page.reload(wait_until="domcontentloaded", timeout=30000)
+            self.page.locator('a[aria-label="Estimate"]').wait_for(state="visible", timeout=30000)
+            self.open_part_type_catalog(oem)
+            if self._part_type_all_models:
+                self.apply_oem_catalog_filter("", open_estimate=False, model_scope="ALL MODELS")
+            try:
+                categories.first.wait_for(state="visible", timeout=CATALOG_LOADING_WAIT_MS)
+            except PlaywrightTimeoutError:
+                pass
+            category_names = categories.all_inner_texts()
+            if category_names:
+                return categories, category_names
+
+        body_text = self.page.locator("body").inner_text()
         not_found_error = catalog_not_found_error(body_text, oem)
         if not_found_error is not None:
             raise not_found_error
         raise CatalogSearchTimeoutError(
-            f"CCC catalog category controls did not load for OEM {oem}; retry required"
+            f"CCC catalog category controls did not load for {lookup_label} {oem}; retry required"
         )
 
     def select_catalog_category(self, category_name: str, oem: str) -> bool:
@@ -602,7 +658,18 @@ class CCCCrawler:
                     continue
         return None
 
-    def read_selected_part_properties(self, selected_part_text: str) -> tuple[str, str]:
+    def read_selected_part_properties(self, selected_part_text: str, select_added_line: bool = False) -> tuple[str, str]:
+        if select_added_line:
+            words = selected_part_text.split()
+            if words and words[0].casefold() in {"right", "left"}:
+                side = "RT" if words[0].casefold() == "right" else "LT"
+                words[0] = side
+            description_pattern = r"\s+".join(re.escape(word) for word in words)
+            estimate_line = self.page.locator(".line-item-display-row .column-description").filter(
+                has_text=re.compile(r"^\s*replace\s+" + description_pattern, re.I)
+            ).last
+            estimate_line.wait_for(state="visible", timeout=15000)
+            estimate_line.click(timeout=10000)
         edit_properties = self.first_visible(
             self.page.get_by_role("button", name=re.compile(r"edit properties", re.I))
         )
@@ -759,6 +826,94 @@ class CCCCrawler:
         source_tab.wait_for(state="visible", timeout=30000)
         source_tab.click()
         source_tag.wait_for(state="visible", timeout=10000)
+        source_tag.click()
+        return self.wait_for_vendor_inventory(), part_number, part_description
+
+    def discover_part_type_categories(self, record: dict[str, str]) -> list[str]:
+        self.ensure_part_type_vehicle(record["VIN"])
+        try:
+            self.open_part_type_catalog(record["Scenario"])
+            _, categories = self.load_catalog_categories(record["Scenario"], lookup_label="scenario")
+            if self._part_type_all_models:
+                self.apply_oem_catalog_filter("", open_estimate=False, model_scope="THIS MODEL w/ OPTIONS")
+                self._part_type_all_models = False
+                _, categories = self.load_catalog_categories(record["Scenario"], lookup_label="scenario")
+            self.apply_oem_catalog_filter("", open_estimate=False, model_scope="ALL MODELS")
+            self._part_type_all_models = True
+            _, all_categories = self.load_catalog_categories(record["Scenario"], lookup_label="scenario")
+            all_matches = matching_part_type_categories(record["Scenario"], all_categories)
+            has_us = any(re.search(r"\bUS\s+BUILT\b", item, re.I) for item in all_matches)
+            has_japan = any(re.search(r"\bJAPAN\s+BUILT\b", item, re.I) for item in all_matches)
+            if has_us and has_japan:
+                log.info("Processing US and Japan build variants for scenario %s; CCC model mismatch prompts may apply", record["Scenario"])
+                return all_matches
+            self.apply_oem_catalog_filter("", open_estimate=False, model_scope="THIS MODEL w/ OPTIONS")
+            self._part_type_all_models = False
+        except CatalogPartNotFoundError:
+            return []
+        return matching_part_type_categories(record["Scenario"], categories)
+
+    def ensure_part_type_vehicle(self, vin: str) -> None:
+        self.recover_closed_page()
+        if self._workfile_initialized and self._part_type_vin == vin:
+            return
+        self._part_type_vin = None
+        self._part_type_all_models = False
+        self.open_new_workfile()
+        if not self.enter_vehicle(vin):
+            self._workfile_initialized = False
+            raise RuntimeError(f"Vehicle/model not found for VIN {vin}")
+        self._part_type_vin = vin
+
+    def open_part_type_catalog(self, scenario: str) -> None:
+        self.dismiss_jumpstart_prompt()
+        self.page.locator('a[aria-label="Estimate"]').click()
+        self.dismiss_jumpstart_prompt()
+
+    def open_part_type_scenario_results(self, scenario: str, category: str) -> tuple[int | None, str, str]:
+        self.open_part_type_catalog(scenario)
+        self.load_catalog_categories(scenario, lookup_label="scenario")
+        if re.search(r"\b(?:US|JAPAN)\s+BUILT\b", category, re.I):
+            categories = self.page.locator("button.group-list-item:visible")
+            if not any(normalize(name) == normalize(category) for name in categories.all_inner_texts()):
+                self.apply_oem_catalog_filter("", open_estimate=False, model_scope="ALL MODELS")
+                self._part_type_all_models = True
+        if not self.select_catalog_category(category, scenario):
+            raise CatalogSearchTimeoutError(f"CCC category '{category}' is no longer available; retry required")
+        parts = self.page.locator("app-part-selector-part-row:visible")
+        scan_started_at = time.monotonic()
+        found = self.wait_for_catalog_element(parts, scenario, f"loading parts in {category}")
+        while not found and not parts.count():
+            self.check_catalog_scan_deadline(scan_started_at, scenario)
+            subgroups = self.page.locator("button.subgroup-button:visible")
+            collapsed = [subgroups.nth(index) for index in range(subgroups.count())
+                         if "expanded" not in (subgroups.nth(index).get_attribute("class") or "")]
+            if not collapsed:
+                raise CatalogSearchTimeoutError(f"CCC showed no part rows in '{category}'; retry required")
+            collapsed[0].click()
+            found = self.wait_for_catalog_element(parts, scenario, f"expanding {category}")
+        candidate = parts.first
+        selected_lines = [line.strip() for line in candidate.inner_text().splitlines() if line.strip()]
+        selected_text = next((line for line in selected_lines if not re.fullmatch(r"[\d.,$]+", line)), "")
+        if not selected_text:
+            raise RuntimeError("Selected catalog part has no readable description")
+        candidate.dblclick(timeout=15000)
+        self.resolve_part_prompts()
+        part_number, part_description = self.read_selected_part_properties(selected_text, select_added_line=True)
+        self.dismiss_enter_part_price_prompt()
+        source_tab = self.page.locator("[role=tab].source-parts-tab")
+        source_tab.wait_for(state="visible", timeout=30000)
+        source_tab.click()
+        source_row = self.page.locator("app-estimate-row").filter(has_text=part_description).last
+        source_row.wait_for(state="visible", timeout=10000)
+        source_tag = source_row.get_by_role("button", name="Show sourced parts")
+        try:
+            source_tag.wait_for(state="visible", timeout=10000)
+        except PlaywrightTimeoutError:
+            if source_tag.count() and source_tag.is_visible():
+                raise
+            self.no_sourceable_candidates = True
+            return None, part_number, part_description
         source_tag.click()
         return self.wait_for_vendor_inventory(), part_number, part_description
 
@@ -1758,24 +1913,31 @@ class CCCCrawler:
     ) -> dict[str, Any]:
         vin = record["VIN"]
         scenario_mode = bool(record.get("Scenario"))
+        part_type_mode = bool(record.get("Part Type Code"))
         partslink = record.get("PARTSLINK", "")
         oem = record.get("OEM", "")
-        lookup_value = partslink if scenario_mode else oem
-        self.checkpoint(f"Input row {record['_row']}: VIN={vin}, {'PARTSLINK' if scenario_mode else 'OEM'}={lookup_value}")
+        lookup_value = record["Scenario"] if part_type_mode else partslink if scenario_mode else oem
+        lookup_label = "Scenario" if part_type_mode else "PARTSLINK" if scenario_mode else "OEM"
+        self.checkpoint(f"Input row {record['_row']}: VIN={vin}, {lookup_label}={lookup_value}")
         result: dict[str, Any] = {
             "Year": "", "Make": "", "Model": "", "VIN": vin,
             "OEM": oem, "Partslink": partslink, "Part Description": "",
         }
         self.no_sourceable_candidates = False
         try:
-            self.recover_closed_page()
-            if not self._workfile_initialized:
-                self.open_new_workfile()
-            elif not self.page.locator('a[aria-label="Vehicle"]').count():
-                if self.workfiles_url:
-                    self.page.goto(self.workfiles_url, wait_until="domcontentloaded")
-                self.open_new_workfile()
-            if not self.enter_vehicle(vin):
+            if part_type_mode:
+                self.ensure_part_type_vehicle(vin)
+                vehicle_selected = True
+            else:
+                self.recover_closed_page()
+                if not self._workfile_initialized:
+                    self.open_new_workfile()
+                elif not self.page.locator('a[aria-label="Vehicle"]').count():
+                    if self.workfiles_url:
+                        self.page.goto(self.workfiles_url, wait_until="domcontentloaded")
+                    self.open_new_workfile()
+                vehicle_selected = self.enter_vehicle(vin)
+            if not vehicle_selected:
                 result["Status"] = "Vehicle/model not found; skipped"
             else:
                 result.update(self._vehicle_details)
@@ -1785,6 +1947,11 @@ class CCCCrawler:
 
                 def open_catalog_lookup() -> int | None:
                     nonlocal selected_oem, part_description
+                    if part_type_mode:
+                        retry_count_value, selected_oem, part_description = self.open_part_type_scenario_results(
+                            record["Scenario"], record["_category"]
+                        )
+                        return retry_count_value
                     if scenario_mode:
                         retry_count_value, selected_oem, part_description = self.open_scenario_part_results(
                             record["Scenario"], record["PARTSLINK"]
@@ -1904,7 +2071,9 @@ class CCCCrawler:
         finally:
             result["date_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         result["Description Target"] = self.description_target
-        if should_retry_row_status(str(result.get("Status") or "")):
+        if should_retry_row_status(str(result.get("Status") or "")) and not (
+            part_type_mode and self.no_sourceable_candidates
+        ):
             self._workfile_initialized = False
             if retry_attempt < MAX_ROW_RETRIES:
                 log.warning(
@@ -1917,6 +2086,101 @@ class CCCCrawler:
                 )
                 return self.crawl_row(record, retry_attempt + 1)
         return result
+
+
+def part_type_key(record: dict[str, Any], saved: bool = False) -> tuple[str, ...]:
+    description_field = "Input Part Type Description" if saved else "Part Type Description"
+    return tuple(normalize(str(record.get(field) or "")) for field in
+                 ("VIN", "Part Type Code", description_field, "Scenario"))
+
+
+def part_type_result_complete(result: dict[str, Any], target: str) -> bool:
+    if normalize(str(result.get("Description Target") or "")) != normalize(target):
+        return False
+    status = normalize(str(result.get("Status") or ""))
+    if status in {"ok", "no matching catalog categories; skipped", "no sourceable parts available; skipped"}:
+        return True
+    if not status.startswith("no offers matching description:"):
+        return False
+    try:
+        market_data = json.loads(str(result.get("market_data") or ""))
+    except (TypeError, ValueError):
+        return False
+    return isinstance(market_data, list) and not market_data_matches_target(market_data, target)
+
+
+def run_part_type_groups(
+    crawler: CCCCrawler,
+    records: list[dict[str, str]],
+    results: list[dict[str, Any]],
+    output: Path,
+    target: str,
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, ...], list[dict[str, str]]] = defaultdict(list)
+    vin_order: dict[str, int] = {}
+    for record in records:
+        vin_order.setdefault(normalize(record["VIN"]), len(vin_order))
+        groups[part_type_key(record)].append(record)
+
+    ordered_groups = sorted(groups.items(), key=lambda item: vin_order[item[0][0]])
+    for group_number, (key, group) in enumerate(ordered_groups, start=1):
+        record = group[0]
+        log.info("Progress: lookup %d/%d for %d matching input row(s)", group_number, len(groups), len(group))
+        previous = [row for row in results if part_type_key(row, saved=True) == key]
+        categories = None
+        for row in previous:
+            try:
+                candidate = json.loads(str(row.get("Scenario Categories") or ""))
+                if isinstance(candidate, list) and all(isinstance(item, str) and item for item in candidate):
+                    categories = candidate
+                    break
+            except (TypeError, ValueError):
+                continue
+        by_category = {normalize(str(row.get("Part Type Description") or "")): row for row in previous
+                       if part_type_result_complete(row, target)}
+
+        def checkpoint(rows: list[dict[str, Any]]) -> None:
+            nonlocal results
+            results = [row for row in results if part_type_key(row, saved=True) != key]
+            for _record in group:
+                results.extend(dict(row) for row in rows)
+            save_results(output, results, PART_TYPE_OUTPUT_COLUMNS)
+
+        def decorate(row: dict[str, Any], category: str, expected: list[str] | None) -> dict[str, Any]:
+            row.update({"VIN": record["VIN"], "Part Type Code": record["Part Type Code"],
+                        "Input Part Type Description": record["Part Type Description"],
+                        "Part Type Description": category, "Scenario": record["Scenario"],
+                        "Scenario Categories": json.dumps(expected) if expected is not None else "",
+                        "Description Target": target})
+            return row
+
+        if categories is None:
+            try:
+                categories = crawler.discover_part_type_categories(record)
+            except Exception as error:
+                log.exception("Could not discover categories for VIN=%s scenario=%s", record["VIN"], record["Scenario"])
+                checkpoint([decorate({"Status": f"ERROR: category discovery failed: {error}",
+                                      "date_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, "", None)])
+                continue
+        if not categories:
+            log.info("No matching catalog category for VIN=%s scenario=%s; continuing with the next scenario", record["VIN"], record["Scenario"])
+            checkpoint([decorate({"Status": "No matching catalog categories; skipped",
+                                  "date_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, "", [])])
+            continue
+
+        previous_by_category = {normalize(str(row.get("Part Type Description") or "")): row for row in previous}
+        rows = [previous_by_category[normalize(category)] for category in categories
+                if normalize(category) in previous_by_category]
+        for category in categories:
+            if normalize(category) in by_category:
+                continue
+            result = crawler.crawl_row({**record, "_category": category})
+            rows = [row for row in rows if normalize(str(row.get("Part Type Description") or "")) != normalize(category)]
+            rows.append(decorate(result, category, categories))
+            checkpoint(rows)
+        if rows and len(rows) == len(categories):
+            checkpoint(rows)
+    return results
 
 
 def main() -> int:
@@ -1933,7 +2197,7 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true", help="Continue from completed rows in the existing output workbook.")
     parser.add_argument(
         "--search-action",
-        choices=("vin_oem", "vin_partslink_scenario"),
+        choices=("vin_oem", "vin_partslink_scenario", "vin_part_type_scenario"),
         default="vin_oem",
     )
     args = parser.parse_args()
@@ -1956,13 +2220,33 @@ def main() -> int:
         log.error("No valid CCC input rows were found in %s", args.input)
         return 2
 
-    results = load_results(args.output) if args.resume else []
+    part_type_mode = args.search_action == "vin_part_type_scenario"
+    if part_type_mode:
+        if args.input.resolve() == args.output.resolve():
+            log.error("Input and output workbooks must be different files.")
+            return 2
+        if args.output.exists() and not args.resume:
+            log.error("Output already exists; use --resume or choose a new output file.")
+            return 2
+        if args.output.exists():
+            try:
+                workbook = load_workbook(args.output, read_only=True, data_only=True)
+                headers = list(next(workbook.active.iter_rows(values_only=True), ()))
+                sheet_names = workbook.sheetnames
+                workbook.close()
+                if headers != PART_TYPE_OUTPUT_COLUMNS or sheet_names != ["CCC Results"]:
+                    raise ValueError("output columns do not match this crawler's result schema")
+            except Exception as error:
+                log.error("Cannot safely resume output workbook: %s", error)
+                return 2
+
+    results = load_results(args.output, preserve_all=part_type_mode) if args.resume else []
     if args.resume:
         log.info("Resume enabled: loaded %d saved result row(s) from %s", len(results), args.output)
     if results:
         log.info("Loaded %d saved result(s) from %s", len(results), args.output)
-    result_slots, pending_groups = prepare_result_slots(records, results, args.description)
-    if not pending_groups:
+    result_slots, pending_groups = ([], {}) if part_type_mode else prepare_result_slots(records, results, args.description)
+    if not part_type_mode and not pending_groups:
         log.info("All %d input rows already have saved results", len(records))
         return 0
 
@@ -1980,6 +2264,8 @@ def main() -> int:
             crawler.sign_in_if_needed()
             context.storage_state(path=str(AUTH_STATE))
             crawler.open_workfiles()
+            if part_type_mode:
+                results = run_part_type_groups(crawler, records, results, args.output, args.description)
             for group_number, (key, indexes) in enumerate(pending_groups.items(), start=1):
                 first_index = indexes[0]
                 log.info(
@@ -1991,12 +2277,14 @@ def main() -> int:
                 result = crawler.crawl_row(records[first_index])
                 for index, expanded in zip(indexes, expand_group_result(result, records, indexes)):
                     result_slots[index] = expanded
-                save_results(args.output, [row for row in result_slots if row is not None])
+                if not part_type_mode:
+                    save_results(args.output, [row for row in result_slots if row is not None])
                 log.info("Saved progress to %s", args.output)
         except Exception as error:
             log.exception("Crawler stopped before completing all rows: %s", error)
             try:
-                save_results(args.output, [row for row in result_slots if row is not None])
+                if not part_type_mode:
+                    save_results(args.output, [row for row in result_slots if row is not None])
             except Exception:
                 log.exception("Could not save partial results to %s", args.output)
             try:
@@ -2013,7 +2301,7 @@ def main() -> int:
                 browser.close()
             except PlaywrightError as error:
                 log.warning("CCC browser was already closed during cleanup: %s", error)
-    completed_rows = sum(result is not None for result in result_slots)
+    completed_rows = len(results) if part_type_mode else sum(result is not None for result in result_slots)
     log.info("Crawl complete: %d/%d rows written to %s", completed_rows, len(records), args.output)
     return 0
 

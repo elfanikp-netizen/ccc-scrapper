@@ -42,6 +42,15 @@ Change the description substring used to select and rank offers with `--descript
 python crawler.py --headed --description "A/M: CAPA"
 ```
 
+For part type scenarios, use `--search-action vin_part_type_scenario` with an input workbook containing `VIN`, `Part Type Code`, `Part Type Description`, and `Scenario`. Each row represents one VIN, part type, and search phrase; the phrase is used as-is, including commas. CCC categories containing the phrase are matched case-insensitively. The first matching category is used, except that all matching `US BUILT` and `JAPAN BUILT` categories are processed when present. The first available part in each selected category is added to the estimate, and its OEM and part description are read from Edit Properties.
+
+```powershell
+python crawler.py --search-action vin_part_type_scenario --input .\data\scenarios.xlsx --output .\results\scenarios.xlsx
+python crawler.py --search-action vin_part_type_scenario --input .\data\scenarios.xlsx --output .\results\scenarios.xlsx --resume
+```
+
+The output includes the chosen category in `Part Type Description`, the original type in `Input Part Type Description`, and the scenario and category list used for resume. Results are saved after each category; duplicate input rows retain duplicate output rows. This mode refuses to overwrite an existing output without `--resume`, rejects an incompatible resume workbook, and requires separate input and output files. Failed categories are retried on resume; completed categories are reused for the same description target.
+
 The input workbook must have `VIN` and `OEM` header columns. The default paths are `input.xlsx` and `ccc-results.xlsx`; set `CCC_INPUT` and `CCC_OUTPUT` in `.env` to change those defaults. Set `CCC_DESCRIPTION` in `.env` to change the default description match (`A/M: CAPA`). Command-line options override their `.env` defaults. Description matching is case-insensitive substring matching, so `A/M: CAPA` also matches descriptions such as `A/M: CAPA, PP`. Results include `Year`, `Make`, and `Model` parsed from CCC's selected-vehicle title, plus `date_time` in local `YYYY-MM-DD HH:MM:SS` format, recorded when that row's crawl processing finishes. `market_data` contains vendor-inventory rows as a JSON array sorted by description, with `description`, `vendor`, `part-no`, `delivery`, `ext-price`, `labor`, `paint`, `total`, `diff`, and `margin` fields. For part numbers, the crawler uses a longer non-truncated title or data attribute when CCC provides one. The browser skips image and media downloads that are not used to read results. Results are checkpointed every 25 newly crawled rows and saved again at normal completion or when an error stops the run; a forced process termination can lose up to 24 rows since the last checkpoint. Authentication cookies/local storage are saved to `playwright/.auth/ccc-state.json` and reused on later runs; delete that file to force a fresh login.
 
 ## Notes

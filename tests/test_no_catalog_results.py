@@ -121,6 +121,12 @@ class NoCatalogResultsDetectionTests(unittest.TestCase):
         body = "No results found for search text: 312768310"
         self.assertTrue(is_no_catalog_results(body))
 
+    def test_multi_word_no_results_identifies_exact_search(self):
+        self.assertIsNotNone(catalog_not_found_error('No results found for search text: "FRONT BUMPER"', "front bumper"))
+        self.assertIsNotNone(catalog_not_found_error("No results found for search text: FRONT BUMPER", "front bumper"))
+        self.assertIsNotNone(catalog_not_found_error("No results found for search text: FRONT BUMPER\nOther controls", "front bumper"))
+        self.assertIsNone(catalog_not_found_error('No results found for search text: "FRONT BUMPER COVER"', "front bumper"))
+
     def test_vin_model_year_code_selects_matching_ccc_option(self):
         vin = "2G1FB1E39D9148021"
 
