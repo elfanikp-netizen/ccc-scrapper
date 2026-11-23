@@ -47,6 +47,11 @@ PART_TYPE_OUTPUT_COLUMNS = OUTPUT_COLUMNS + [
     "Part Type Code", "Part Type Description", "Input Part Type Description",
     "Scenario", "Scenario Categories", "Catalog Part", "Category Parts",
 ]
+VENDOR_OUTPUT_COLUMNS = [
+    "Input Row", "Year", "Make", "Model", "VIN", "OEM", "Part Description",
+    "Vendor Match", "Vendor", "Description", "PART#", "Delivery", "EXT. PRICE",
+    "Labor", "Paint", "Total", "Diff", "Margin", "Status", "date_time", "market_data",
+]
 IPART_VENDOR = "iPart Automotive Inc."
 TARGET_DESCRIPTION = "A/M: CAPA"
 MAX_VENDOR_SEARCH_RETRIES = 3
@@ -198,11 +203,21 @@ def market_data_matches_target(market_data: Any, target: str) -> bool:
             market_data = json.loads(market_data)
         except json.JSONDecodeError:
             return False
-    return isinstance(market_data, list) and any(
-        isinstance(row, dict)
-        and description_matches_target(str(row.get("description") or ""), target)
-        for row in market_data
-    )
+    normalized_target = normalize(target)
+    if not isinstance(market_data, list) or not normalized_target:
+        return False
+    for row in market_data:
+        if not isinstance(row, dict):
+            continue
+        if "description_expand" in row:
+            if description_matches_target(str(row.get("description") or ""), target):
+                return True
+        elif row.get("description_type"):
+            if description_matches_target(str(row["description_type"]), target):
+                return True
+        elif re.match(re.escape(normalized_target) + r"(?=$|[\s,;])", normalize(str(row.get("description") or ""))):
+            return True
+    return False
 
 
 def should_retry_row_status(status: str) -> bool:
@@ -248,6 +263,82 @@ def parse_price(value: str) -> float | None:
         return float(cleaned)
     except ValueError:
         return None
+
+
+def prefer_full_part_number(visible: str, candidates: list[str]) -> str:
+    visible = (visible or "").strip()
+    full_values = [value.strip() for value in candidates if value and value.strip()]
+    if "..." in visible or "…" in visible:
+        untruncated = [value for value in full_values if "..." not in value and "…" not in value]
+        if untruncated:
+            return max(untruncated, key=len)
+    longer_values = [value for value in full_values if len(value) > len(visible)]
+    return max(longer_values, key=len) if longer_values else visible
+
+
+def prefer_cell_title(visible: str, title: str | None) -> str:
+    full_title = (title or "").strip()
+    return full_title if full_title else (visible or "").strip()
+
+
+def preferred_market_description(visible: str, detail: str | None) -> str:
+    full_detail = (detail or "").strip()
+    return full_detail if full_detail else (visible or "").strip()
+
+
+def parse_vendor_match(value: str) -> list[tuple[str, bool]]:
+    return [(term.replace("*", "").strip().casefold(), "*" in term)
+            for term in (part.strip() for part in value.split(",")) if term.replace("*", "").strip()]
+
+
+def vendor_matches(vendor: str, terms: list[tuple[str, bool]]) -> bool:
+    candidate = vendor.strip().casefold()
+    return any(term in candidate if contains else candidate == term for term, contains in terms)
+
+
+def vendor_output_rows(record: dict[str, Any], result: dict[str, Any], vendor_match: str) -> list[dict[str, Any]]:
+    raw_market = result.get("market_data") or []
+    if isinstance(raw_market, str):
+        try:
+            raw_market = json.loads(raw_market)
+        except json.JSONDecodeError:
+            raw_market = []
+    terms = parse_vendor_match(vendor_match)
+    base = {
+        "Input Row": record.get("_row", ""),
+        "Year": result.get("Year", ""), "Make": result.get("Make", ""), "Model": result.get("Model", ""),
+        "VIN": record.get("VIN", ""), "OEM": record.get("OEM", ""),
+        "Part Description": result.get("Part Description", ""), "Vendor Match": vendor_match,
+        "date_time": result.get("date_time", ""),
+        "market_data": json.dumps(raw_market, ensure_ascii=False),
+    }
+    rows = []
+    if isinstance(raw_market, list):
+        for offer in raw_market:
+            if not isinstance(offer, dict):
+                continue
+            vendor = str(next((value for key, value in offer.items() if key.casefold() == "vendor"), "") or "").strip()
+            if not vendor_matches(vendor, terms):
+                continue
+            field_map = {
+                "Vendor": "vendor", "Description": "description", "PART#": "part-no",
+                "Delivery": "delivery", "EXT. PRICE": "ext-price", "Labor": "labor",
+                "Paint": "paint", "Total": "total", "Diff": "diff", "Margin": "margin",
+            }
+            row = dict(base)
+            for output_field, source_field in field_map.items():
+                row[output_field] = next((value for key, value in offer.items() if key.casefold().replace("_", "-") == source_field), "")
+            if offer.get("description_expand"):
+                row["Description"] = offer["description_expand"]
+            row["Status"] = "OK"
+            rows.append(row)
+    if not rows:
+        row = dict(base)
+        for field in VENDOR_OUTPUT_COLUMNS:
+            row.setdefault(field, "")
+        row["Status"] = result.get("Status") if not raw_market else "No market offers matched vendor criteria"
+        rows.append(row)
+    return rows
 
 
 def extract_vehicle_details(page_text: str) -> dict[str, str]:
@@ -378,7 +469,7 @@ def load_results(path: Path, preserve_all: bool = False) -> list[dict[str, Any]]
             result = {
                 column: row[index] if index < len(row) else None
                 for column, index in header_indexes.items()
-                if column in PART_TYPE_OUTPUT_COLUMNS or column == "OG OEM"
+                if column in PART_TYPE_OUTPUT_COLUMNS or column in VENDOR_OUTPUT_COLUMNS or column == "OG OEM"
             }
             if result.get("OG OEM"):
                 result["Partslink"] = result.get("Partslink") or result.get("OEM")
@@ -480,6 +571,37 @@ def expand_group_result(
             row["OEM"] = records[index]["OEM"]
         expanded.append(row)
     return expanded
+
+
+def vendor_row_key(record: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (str(record.get("Input Row") or "").strip(), str(record.get("VIN") or "").strip(),
+            str(record.get("OEM") or "").strip().casefold(), str(record.get("Vendor Match") or "").strip().casefold())
+
+
+def run_vendor_mode(
+    crawler: CCCCrawler,
+    records: list[dict[str, str]],
+    results: list[dict[str, Any]],
+    output: Path,
+    vendor_match: str,
+) -> list[dict[str, Any]]:
+    complete_statuses = {"ok", "no market offers matched vendor criteria", "no sourceable parts available; skipped"}
+    total = len(records)
+    for index, record in enumerate(records, start=1):
+        key = (record["_row"], record["VIN"], record["OEM"].casefold(), vendor_match.casefold())
+        previous = [row for row in results if vendor_row_key(row) == key]
+        if previous and all(str(row.get("Status") or "").strip().casefold() in complete_statuses for row in previous):
+            log.info("Progress: lookup %d/%d already saved for VIN=%s OEM=%s", index, total, record["VIN"], record["OEM"])
+            continue
+
+        log.info("Progress: lookup %d/%d for VIN=%s OEM=%s", index, total, record["VIN"], record["OEM"])
+        result = crawler.crawl_row(record)
+        output_rows = vendor_output_rows(record, result, vendor_match)
+        results = [row for row in results if vendor_row_key(row) != key]
+        results.extend(output_rows)
+        save_results(output, results, VENDOR_OUTPUT_COLUMNS)
+        log.info("Saved %d vendor result row(s) for input row %s", len(output_rows), record["_row"])
+    return results
 
 
 class CCCCrawler:
@@ -1470,17 +1592,6 @@ class CCCCrawler:
             self.no_sourceable_candidates = False
         self.checkpoint(f"Estimate: searching OEM {oem}")
         self.apply_oem_catalog_filter(oem)
-        source_tab = self.page.locator("[role=tab].source-parts-tab")
-        source_tag = self.page.get_by_role("button", name="Show sourced parts").first
-        if (
-            source_tab.count()
-            and source_tab.get_attribute("aria-disabled") == "false"
-            and source_tag.is_visible()
-        ):
-            self.checkpoint(f"Source parts are ready after OEM search for {oem}; opening them directly")
-            source_tab.click()
-            source_tag.click()
-            return self.wait_for_vendor_inventory()
         categories, category_names = self.load_catalog_categories(oem)
 
         parts = self.page.locator("app-part-selector-part-row:visible")
@@ -1584,6 +1695,7 @@ class CCCCrawler:
             candidate = parts.nth(part_index)
             if not candidate.count():
                 break
+            selected_text = catalog_part_description(candidate.inner_text())
             self.checkpoint(f"Double-clicking catalog result {part_index + 1} for OEM {oem}")
             try:
                 candidate.dblclick(timeout=15000)
@@ -1593,15 +1705,12 @@ class CCCCrawler:
                 continue
             self.resolve_part_prompts()
             price_prompt_acknowledged = self.dismiss_enter_part_price_prompt()
+            _, part_description = self.read_selected_part_properties(
+                selected_text, select_added_line=True
+            )
             if price_prompt_acknowledged:
-                source_tab = self.page.locator("[role=tab].source-parts-tab")
-                source_tab.wait_for(state="visible", timeout=10000)
                 self.checkpoint(f"Opening Source parts after accepting the price prompt for OEM {oem}")
-                source_tab.click(timeout=10000)
-                source_tag = self.page.get_by_role("button", name="Show sourced parts").first
-                source_tag.wait_for(state="visible", timeout=10000)
-                source_tag.click()
-                return self.wait_for_vendor_inventory()
+                return self.open_sourced_parts_for_estimate_line(part_description)
             body_text = normalize(self.page.locator("body").inner_text())
             no_source_parts = bool(NO_SOURCE_PARTS_RE.search(body_text))
             source_tab = self.page.locator("[role=tab].source-parts-tab")
@@ -1644,9 +1753,13 @@ class CCCCrawler:
                     attempted_catalog_parts.add(candidate_key)
                     return None
                 log.warning("CCC Source parts tab is %s for OEM %s; retrying the estimate line", enabled, oem)
-                return self.retry_source_parts(oem)
+                return self.retry_source_parts(oem, part_description)
             source_tab.click()
-            source_tag = self.page.get_by_role("button", name="Show sourced parts").first
+            source_row = self.page.locator("app-estimate-row").filter(
+                has_text=part_description
+            ).last
+            source_row.wait_for(state="visible", timeout=10000)
+            source_tag = source_row.get_by_role("button", name="Show sourced parts")
             try:
                 source_tag.wait_for(state="visible", timeout=10000)
             except PlaywrightTimeoutError as error:
@@ -1672,6 +1785,22 @@ class CCCCrawler:
         if attempted_catalog_parts:
             self.no_sourceable_candidates = True
         return None
+
+    def open_sourced_parts_for_estimate_line(self, part_description: str) -> int | None:
+        part_description = part_description.strip()
+        if not part_description:
+            raise RuntimeError("Selected estimate line has no description; refusing to source another part")
+        source_tab = self.page.locator("[role=tab].source-parts-tab")
+        source_tab.wait_for(state="visible", timeout=10000)
+        source_tab.click(timeout=10000)
+        source_row = self.page.locator("app-estimate-row").filter(
+            has_text=part_description
+        ).last
+        source_row.wait_for(state="visible", timeout=10000)
+        source_tag = source_row.get_by_role("button", name="Show sourced parts")
+        source_tag.wait_for(state="visible", timeout=10000)
+        source_tag.click(timeout=10000)
+        return self.wait_for_vendor_inventory()
 
     def dismiss_enter_part_price_prompt(self) -> bool:
         prompt = self.page.get_by_text(
@@ -1704,7 +1833,7 @@ class CCCCrawler:
         prompt.wait_for(state="hidden", timeout=10000)
         return True
 
-    def retry_source_parts(self, oem: str) -> int | None:
+    def retry_source_parts(self, oem: str, part_description: str) -> int | None:
         retry_button = self.first_visible(
             self.page.get_by_role("button", name=re.compile(r"^\s*RETRY\s*$", re.I))
         )
@@ -1733,9 +1862,7 @@ class CCCCrawler:
         if outcome == "no-source":
             return None
         if outcome == "enabled":
-            self.page.locator('[role="tab"].source-parts-tab').click(timeout=10000)
-            self.page.get_by_role("button", name="Show sourced parts").first.click(timeout=10000)
-            return self.wait_for_vendor_inventory()
+            return self.open_sourced_parts_for_estimate_line(part_description)
         if outcome == "retry":
             return None
         raise RuntimeError(f"CCC Source parts preparation did not recover for OEM {oem} ({outcome})")
@@ -1858,8 +1985,14 @@ class CCCCrawler:
                 };
                 const outputFields = [...new Set(Object.values(fields))];
                 const attributes = ['data-full-value', 'data-original-value', 'data-value', 'title', 'aria-label'];
-                return rows.map(row => {
+                return rows.map((row, rowIndex) => {
                     const data = Object.fromEntries(outputFields.map(field => [field, '']));
+                    data.rowIndex = rowIndex;
+                    data.partNoCandidates = [];
+                    data.partNoTitle = '';
+                    data.vendorCandidates = [];
+                    data.vendorTitle = '';
+                    data.descriptionTitle = '';
                     for (const cell of row.querySelectorAll('[class*="column-"]')) {
                         const columnClass = [...cell.classList].find(name => name.startsWith('column-')) || '';
                         const key = columnClass.slice(7).toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -1867,12 +2000,21 @@ class CCCCrawler:
                         if (!field) continue;
                         let value = (cell.innerText || cell.textContent || '').trim();
                         if (field === 'part-no') {
+                            data.partNoTitle = cell.querySelector('p[title]')?.getAttribute('title') || '';
                             const candidates = [cell, ...cell.querySelectorAll('*')].flatMap(node =>
                                 attributes.map(name => node.getAttribute(name)).filter(candidate => candidate && candidate.trim())
                             ).map(candidate => candidate.trim()).filter(candidate =>
-                                candidate.length > value.length && !/(?:\\.\\.\\.|…)/.test(candidate)
+                                candidate.length > value.length
                             );
-                            if (candidates.length) value = candidates.reduce((best, candidate) => candidate.length > best.length ? candidate : best, value);
+                            data.partNoCandidates = candidates;
+                        } else if (field === 'vendor') {
+                            data.vendorTitle = cell.querySelector('p[title], span[title]')?.getAttribute('title') || '';
+                            data.vendorCandidates = [cell, ...cell.querySelectorAll('*')].flatMap(node =>
+                                ['data-full-value', 'data-original-value', 'data-value', 'title']
+                                    .map(name => node.getAttribute(name)).filter(candidate => candidate && candidate.trim())
+                            ).map(candidate => candidate.trim());
+                        } else if (field === 'description') {
+                            data.descriptionTitle = cell.querySelector('p[title], span[title]')?.getAttribute('title') || '';
                         }
                         data[field] = value;
                     }
@@ -1880,6 +2022,36 @@ class CCCCrawler:
                 }).filter(data => Object.values(data).some(Boolean));
             }"""
         )
+        for row in rows:
+            row_index = row.pop("rowIndex", -1)
+            candidates = [row.pop("partNoTitle", ""), *row.pop("partNoCandidates", [])]
+            row["part-no"] = prefer_full_part_number(row.get("part-no", ""), candidates)
+            vendor_title = row.pop("vendorTitle", "")
+            vendor_candidates = row.pop("vendorCandidates", [])
+            row["vendor"] = prefer_full_part_number(row.get("vendor", ""), [vendor_title, *vendor_candidates])
+            description_title = row.pop("descriptionTitle", "")
+            row["description"] = prefer_cell_title(row.get("description", ""), description_title)
+            row["description_expand"] = ""
+            if row_index >= 0 and row["description"]:
+                try:
+                    grid_row = self.page.locator(".cdk-overlay-pane .table-row").nth(row_index)
+                    description_cell = grid_row.locator(".column-description").first
+                    detail = self.page.locator(".preview-section .display-text p:visible").last
+                    previous_detail = detail.inner_text().strip() if detail.count() else ""
+                    description_cell.click(timeout=5000)
+                    detail.wait_for(state="visible", timeout=5000)
+                    if previous_detail:
+                        try:
+                            self.page.wait_for_function(
+                                "previous => { const item = [...document.querySelectorAll('.preview-section .display-text p')].find(e => e.offsetWidth || e.offsetHeight); return item && item.innerText.trim() !== previous; }",
+                                arg=previous_detail,
+                                timeout=3000,
+                            )
+                        except PlaywrightTimeoutError:
+                            pass
+                    row["description_expand"] = detail.inner_text().strip()
+                except (PlaywrightError, PlaywrightTimeoutError):
+                    pass
         market_data = sorted(rows, key=lambda item: normalize(item.get("description", "")))
         offers = []
         for row in market_data:
@@ -1896,12 +2068,15 @@ class CCCCrawler:
         done = self.page.locator(".cdk-overlay-pane button").filter(
             has_text=re.compile(r"^\s*DONE\s*$", re.I)
         )
+        inventory_pane = done.first.locator(
+            "xpath=ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' cdk-overlay-pane ')]"
+        )
         try:
             done.first.wait_for(state="visible", timeout=10000)
             done.first.click(timeout=10000)
         except PlaywrightTimeoutError:
             raise RuntimeError("CCC vendor inventory results loaded, but the modal Done button was not found") from None
-        self.page.locator(".cdk-overlay-pane").wait_for(state="hidden", timeout=15000)
+        inventory_pane.wait_for(state="hidden", timeout=15000)
         self.checkpoint("CCC vendor inventory modal closed")
 
     @staticmethod
@@ -2263,9 +2438,11 @@ def main() -> int:
     )
     parser.add_argument("--headed", action="store_true", help="Show the browser window (recommended for first run).")
     parser.add_argument("--resume", action="store_true", help="Continue from completed rows in the existing output workbook.")
+    parser.add_argument("--vendor-match", default=os.getenv("CCC_VENDOR_MATCH", ""),
+                        help="Comma-separated vendor names; * marks a substring match.")
     parser.add_argument(
         "--search-action",
-        choices=("vin_oem", "vin_partslink_scenario", "vin_part_type_scenario"),
+        choices=("vin_oem", "vin_partslink_scenario", "vin_part_type_scenario", "vin_oem_vendors"),
         default="vin_oem",
     )
     args = parser.parse_args()
@@ -2289,7 +2466,11 @@ def main() -> int:
         return 2
 
     part_type_mode = args.search_action == "vin_part_type_scenario"
-    if part_type_mode:
+    vendor_mode = args.search_action == "vin_oem_vendors"
+    if vendor_mode and not parse_vendor_match(args.vendor_match):
+        log.error("Vendor mode requires at least one vendor name in --vendor-match.")
+        return 2
+    if part_type_mode or vendor_mode:
         if args.input.resolve() == args.output.resolve():
             log.error("Input and output workbooks must be different files.")
             return 2
@@ -2302,19 +2483,20 @@ def main() -> int:
                 headers = list(next(workbook.active.iter_rows(values_only=True), ()))
                 sheet_names = workbook.sheetnames
                 workbook.close()
-                if headers not in (PART_TYPE_OUTPUT_COLUMNS, PART_TYPE_OUTPUT_COLUMNS[:-2]) or sheet_names != ["CCC Results"]:
+                allowed_headers = (PART_TYPE_OUTPUT_COLUMNS, PART_TYPE_OUTPUT_COLUMNS[:-2]) if part_type_mode else (VENDOR_OUTPUT_COLUMNS,)
+                if headers not in allowed_headers or sheet_names != ["CCC Results"]:
                     raise ValueError("output columns do not match this crawler's result schema")
             except Exception as error:
                 log.error("Cannot safely resume output workbook: %s", error)
                 return 2
 
-    results = load_results(args.output, preserve_all=part_type_mode) if args.resume else []
+    results = load_results(args.output, preserve_all=part_type_mode or vendor_mode) if args.resume else []
     if args.resume:
         log.info("Resume enabled: loaded %d saved result row(s) from %s", len(results), args.output)
     if results:
         log.info("Loaded %d saved result(s) from %s", len(results), args.output)
-    result_slots, pending_groups = ([], {}) if part_type_mode else prepare_result_slots(records, results, args.description)
-    if not part_type_mode and not pending_groups:
+    result_slots, pending_groups = ([], {}) if part_type_mode or vendor_mode else prepare_result_slots(records, results, args.description)
+    if not part_type_mode and not vendor_mode and not pending_groups:
         log.info("All %d input rows already have saved results", len(records))
         return 0
 
@@ -2334,6 +2516,8 @@ def main() -> int:
             crawler.open_workfiles()
             if part_type_mode:
                 results = run_part_type_groups(crawler, records, results, args.output, args.description)
+            elif vendor_mode:
+                results = run_vendor_mode(crawler, records, results, args.output, args.vendor_match)
             for group_number, (key, indexes) in enumerate(pending_groups.items(), start=1):
                 first_index = indexes[0]
                 log.info(
@@ -2345,13 +2529,13 @@ def main() -> int:
                 result = crawler.crawl_row(records[first_index])
                 for index, expanded in zip(indexes, expand_group_result(result, records, indexes)):
                     result_slots[index] = expanded
-                if not part_type_mode:
+                if not part_type_mode and not vendor_mode:
                     save_results(args.output, [row for row in result_slots if row is not None])
                 log.info("Saved progress to %s", args.output)
         except Exception as error:
             log.exception("Crawler stopped before completing all rows: %s", error)
             try:
-                if not part_type_mode:
+                if not part_type_mode and not vendor_mode:
                     save_results(args.output, [row for row in result_slots if row is not None])
             except Exception:
                 log.exception("Could not save partial results to %s", args.output)
@@ -2369,7 +2553,7 @@ def main() -> int:
                 browser.close()
             except PlaywrightError as error:
                 log.warning("CCC browser was already closed during cleanup: %s", error)
-    completed_rows = len(results) if part_type_mode else sum(result is not None for result in result_slots)
+    completed_rows = len(records) if vendor_mode else len(results) if part_type_mode else sum(result is not None for result in result_slots)
     log.info("Crawl complete: %d/%d rows written to %s", completed_rows, len(records), args.output)
     return 0
 

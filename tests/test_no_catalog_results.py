@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,11 +28,129 @@ from crawler import (
     save_results,
     should_retry_row_status,
     vin_model_year_matches,
+    prefer_full_part_number,
+    prefer_cell_title,
+    preferred_market_description,
+    parse_vendor_match,
+    read_input,
+    run_vendor_mode,
+    VENDOR_OUTPUT_COLUMNS,
+    vendor_output_rows,
+    vendor_matches,
     validate_selected_vehicle_year,
 )
 
 
 class NoCatalogResultsDetectionTests(unittest.TestCase):
+    def test_part_number_prefers_full_title_value_over_ellipsized_text(self):
+        self.assertEqual(prefer_full_part_number("...1190X953", ["521190X953"]), "521190X953")
+        self.assertEqual(prefer_full_part_number("...O1000466", ["TO1000466"]), "TO1000466")
+        self.assertEqual(prefer_full_part_number("TY6706LF", ["TY6706LF"]), "TY6706LF")
+
+    def test_vendor_prefers_full_title_value_over_ellipsized_text(self):
+        self.assertEqual(prefer_full_part_number("Long Supplier Name...", ["Long Supplier Name Incorporated"]),
+                         "Long Supplier Name Incorporated")
+
+    def test_market_description_uses_full_cell_title(self):
+        visible = "RECY: BUMPER COVER FR"
+        title = "RECY: BUMPER COVER FRONT W/O PARKING SENSORS"
+        self.assertEqual(prefer_cell_title(visible, title), "RECY: BUMPER COVER FRONT W/O PARKING SENSORS")
+        self.assertEqual(prefer_cell_title("A/M: CAPA", None), "A/M: CAPA")
+
+    def test_market_description_prefers_clicked_detail_text(self):
+        self.assertEqual(preferred_market_description("RECY: BUMPER COVER FR", "RECY: BUMPER COVER FRONT OEM BUMPER"),
+                         "RECY: BUMPER COVER FRONT OEM BUMPER")
+        self.assertEqual(preferred_market_description("A/M: CAPA", ""), "A/M: CAPA")
+
+    def test_oem_source_lookup_targets_the_selected_estimate_description(self):
+        page = MagicMock()
+        source_tab = MagicMock()
+        estimate_rows = MagicMock()
+        selected_row = MagicMock()
+        page.locator.side_effect = [source_tab, estimate_rows]
+        estimate_rows.filter.return_value.last = selected_row
+        crawler = CCCCrawler(page, "user", "password", Path("."))
+        crawler.wait_for_vendor_inventory = MagicMock(return_value=0)
+
+        self.assertEqual(crawler.open_sourced_parts_for_estimate_line("Front Bumper"), 0)
+
+        estimate_rows.filter.assert_called_once_with(has_text="Front Bumper")
+        selected_row.get_by_role.assert_called_once_with("button", name="Show sourced parts")
+
+    def test_oem_source_lookup_refuses_an_empty_estimate_description(self):
+        page = MagicMock()
+        crawler = CCCCrawler(page, "user", "password", Path("."))
+
+        with self.assertRaisesRegex(RuntimeError, "no description"):
+            crawler.open_sourced_parts_for_estimate_line(" ")
+
+        page.locator.assert_not_called()
+
+    def test_vendor_match_supports_exact_substring_and_comma_alternatives(self):
+        terms = parse_vendor_match("Cherry*, K & P AUTO DISMANTLERS")
+        self.assertTrue(vendor_matches("Cherry Auto Parts", terms))
+        self.assertTrue(vendor_matches("K & P AUTO DISMANTLERS", terms))
+        self.assertFalse(vendor_matches("K & P AUTO DISMANTLERS West", terms))
+        self.assertFalse(vendor_matches("Other Cherry Supplier", parse_vendor_match("Cherry Auto Parts")))
+
+    def test_vendor_output_emits_each_matching_market_offer(self):
+        record = {"_row": "2", "VIN": "VIN1", "OEM": "OEM1"}
+        result = {"Year": "2020", "Make": "Toyota", "Model": "Camry", "Part Description": "Bumper",
+                  "market_data": [{"vendor": "Cherry Auto Parts West", "description": "A/M", "part-no": "P1", "ext-price": "10"},
+                                  {"vendor": "K & P AUTO DISMANTLERS", "description": "OEM", "part-no": "P2", "ext-price": "20"},
+                                  {"vendor": "Other Vendor", "description": "A/M", "part-no": "P3", "ext-price": "30"}]}
+        rows = vendor_output_rows(record, result, "Cherry*, K & P AUTO DISMANTLERS")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["PART#"] for row in rows], ["P1", "P2"])
+        self.assertEqual([row["EXT. PRICE"] for row in rows], ["10", "20"])
+        self.assertEqual(json.loads(rows[0]["market_data"]), result["market_data"])
+
+    def test_vendor_mode_saves_each_offer_and_resumes_without_duplicate_crawl(self):
+        record = {"_row": "2", "VIN": "VIN1", "OEM": "OEM1"}
+        crawler = MagicMock()
+        crawler.crawl_row.return_value = {
+            "Year": "2020", "Make": "Toyota", "Model": "Camry", "Part Description": "Bumper",
+            "Status": "OK", "market_data": [
+                {"vendor": "Cherry Auto Parts", "description": "A/M", "part-no": "P1", "ext-price": "10"},
+                {"vendor": "Cherry Auto Parts West", "description": "A/M", "part-no": "P2", "ext-price": "11"},
+                {"vendor": "K & P AUTO DISMANTLERS", "description": "OEM", "part-no": "P3", "ext-price": "12"},
+            ],
+        }
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "vendors.xlsx"
+            results = run_vendor_mode(crawler, [record], [], output, "Cherry*, K & P AUTO DISMANTLERS")
+            self.assertEqual([row["PART#"] for row in results], ["P1", "P2", "P3"])
+            self.assertEqual(results[0]["Status"], "OK")
+            loaded = load_results(output, preserve_all=True)
+            self.assertEqual(len(loaded), 3)
+            resumed = run_vendor_mode(crawler, [record], loaded, output, "Cherry*, K & P AUTO DISMANTLERS")
+            self.assertEqual(len(resumed), 3)
+            crawler.crawl_row.assert_called_once_with(record)
+            workbook = load_workbook(output, read_only=True, data_only=True)
+            try:
+                self.assertEqual(next(workbook.active.iter_rows(values_only=True)), tuple(VENDOR_OUTPUT_COLUMNS))
+            finally:
+                workbook.close()
+
+    def test_vendor_input_expands_oems_and_keeps_only_matching_market_rows(self):
+        with TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.xlsx"
+            workbook = Workbook()
+            workbook.active.append(["VIN", "OEM"])
+            workbook.active.append(["VIN1", "OEM1, OEM2"])
+            workbook.save(input_path)
+            workbook.close()
+            records = read_input(input_path, "vin_oem_vendors")
+        self.assertEqual([row["OEM"] for row in records], ["OEM1", "OEM2"])
+        result = {"VIN": "VIN1", "market_data": [
+            {"vendor": "Cherry Auto Parts", "description": "A/M", "part-no": "1", "ext-price": "10"},
+            {"vendor": "Cherry Auto Parts East", "description": "A/M", "part-no": "2", "ext-price": "11"},
+            {"vendor": "K & P AUTO DISMANTLERS", "description": "OEM", "part-no": "3", "ext-price": "12"},
+        ]}
+        rows = vendor_output_rows(records[0], result, "Cherry*, K & P AUTO DISMANTLERS")
+        self.assertEqual([row["PART#"] for row in rows], ["1", "2", "3"])
+        self.assertEqual([row["OEM"] for row in rows], ["OEM1"] * 3)
+
     def test_result_columns_put_partslink_before_oem_without_og_oem(self):
         self.assertIn("Partslink", OUTPUT_COLUMNS)
         self.assertIn("OEM", OUTPUT_COLUMNS)
